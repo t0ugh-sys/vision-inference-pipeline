@@ -161,6 +161,8 @@ set(DECODER_SOURCES "")
 set(PREPROC_SOURCES "")
 set(INFER_SOURCES "")
 set(POSTPROC_SOURCES "")
+set(VISUAL_SOURCES "")
+set(ENCODER_SOURCES "")
 
 # MPP 解码器
 if(ENABLE_MPP_DECODER)
@@ -241,6 +243,15 @@ list(APPEND POSTPROC_SOURCES
     src/backends/postproc_factory.cpp
 )
 
+# 编码器 (NVENC)
+if(ENABLE_NVDEC_DECODER)
+    list(APPEND ENCODER_SOURCES
+        src/backends/nvenc_encoder.cpp
+        src/backends/encoder_factory.cpp
+    )
+    add_compile_definitions(ENABLE_NVENC_ENCODER)
+endif()
+
 # 可视化 (OpenCV)
 if(OpenCV_FOUND)
     list(APPEND VISUAL_SOURCES
@@ -259,6 +270,7 @@ add_executable(video_pipeline
     ${PREPROC_SOURCES}
     ${INFER_SOURCES}
     ${POSTPROC_SOURCES}
+    ${ENCODER_SOURCES}
     ${VISUAL_SOURCES}
 )
 
@@ -328,5 +340,6 @@ message(STATUS "CUDA Preproc: ${ENABLE_CUDA_PREPROC}")
 message(STATUS "RKNN Infer: ${ENABLE_RKNN_INFER}")
 message(STATUS "TensorRT Infer: ${ENABLE_TRT_INFER}")
 message(STATUS "Postproc: ON")
+message(STATUS "NVENC Encoder: ${ENABLE_NVENC_ENCODER}")
 message(STATUS "===========================")
 message(STATUS "")
