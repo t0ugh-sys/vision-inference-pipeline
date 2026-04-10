@@ -1,6 +1,13 @@
 # video-pipeline-cpp
 
-一个支持 **Rockchip** 和 **NVIDIA** 双平台的视频推理最小工程骨架。
+一个面向 **Rockchip** 与 **NVIDIA** 平台的视频推理部署工程，聚焦解码、预处理、推理后端适配与性能分析。
+
+## 项目定位
+
+- 这是一个偏**部署工程**的项目，不是训练或算法研究仓库。
+- 重点在于打通 `FFmpeg -> Decoder -> Preprocess -> Inference -> Postprocess` 的完整视频推理链路。
+- 核心价值是对比 **RKNN / TensorRT** 等部署后端在边缘端和 GPU 平台上的工程取舍。
+- 适合作为视频推理系统、边缘 AI 部署、跨平台视觉工程的作品集项目。
 
 ## 支持的硬件后端
 
@@ -159,3 +166,49 @@ video-pipeline-cpp/
 ## License
 
 MIT License - 详见 [LICENSE](LICENSE) 文件
+
+## 整体架构图
+
+```mermaid
+flowchart TD
+    CLI[CLI / main.cpp] --> CONFIG[app_config<br/>参数解析与运行配置]
+    CONFIG --> VALIDATE[backend_registry + validateAppConfig<br/>编译能力校验]
+    VALIDATE --> RUNNER[pipeline_runner<br/>流水线编排]
+
+    RUNNER --> SRC[FFmpegPacketSource<br/>读取视频或 RTSP]
+    SRC --> PKT[EncodedPacket]
+    PKT --> DECODER[Decoder Backend<br/>NVDEC / MPP]
+    DECODER --> FRAME[DecodedFrame<br/>NV12 / Device Frame]
+    FRAME --> PREPROC[Preprocessor Backend<br/>CUDA / RGA]
+    PREPROC --> IMAGE[RgbImage]
+    IMAGE --> INFER[Inference Backend<br/>TensorRT / RKNN]
+    INFER --> TENSOR[Output Tensor]
+    TENSOR --> POST[Postprocessor<br/>YOLO]
+    POST --> DET[DetectionResult]
+    DET --> VIS[Visualizer<br/>OpenCV / Null]
+    DET --> ENC[Encoder<br/>NVENC / MPP]
+```
+
+```text
+主数据流:
+InputSource -> EncodedPacket -> DecodedFrame -> RgbImage -> Output Tensor -> DetectionResult
+
+NVIDIA 路线:
+FFmpeg -> NVDEC -> CUDA Preproc -> TensorRT -> YOLO -> OpenCV / NVENC
+
+Rockchip 路线:
+FFmpeg -> MPP -> RGA -> RKNN -> YOLO -> OpenCV / MPP
+```
+## Showcase Scope
+
+This repository is positioned as a deployment-oriented portfolio project:
+
+- hardware-aware video inference pipeline
+- backend capability validation
+- RKNN / TensorRT deployment integration
+- deployment tradeoff comparison across Rockchip and NVIDIA targets
+
+Related material:
+
+- deployment comparison: [docs/deployment_comparison.md](docs/deployment_comparison.md)
+- benchmark project: [vision-inference-benchmark](https://github.com/t0ugh-sys/vision-inference-benchmark)
