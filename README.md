@@ -1,6 +1,6 @@
-# video-pipeline-cpp
+# vision-inference-pipeline
 
-一个面向 **Rockchip** 与 **NVIDIA** 平台的视频推理部署骨架，聚焦后端适配、运行链路与工程化集成。
+一个面向 **Rockchip** 与 **NVIDIA** 平台的视觉推理部署骨架，聚焦后端适配、运行链路与工程化集成。
 
 ## 项目定位
 
@@ -73,7 +73,7 @@ Options:
 ## 目录结构
 
 ```
-video-pipeline-cpp/
+vision-inference-pipeline/
 ├── include/
 │   ├── decoder_interface.hpp    # 解码器接口
 │   ├── preproc_interface.hpp    # 预处理接口
