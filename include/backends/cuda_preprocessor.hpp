@@ -3,12 +3,7 @@
 #include "preproc_interface.hpp"
 #include "pipeline_types.hpp"
 
-#include <vector>
 #include <cstdint>
-
-// CUDA forward declarations
-struct CUstream_st;
-typedef CUstream_st* CUstream;
 
 /**
  * NVIDIA CUDA 预处理器
@@ -22,7 +17,7 @@ class CudaPreprocessor : public IPreprocessorBackend {
   RgbImage convertAndResize(
       const DecodedFrame& frame,
       int outputWidth,
-      int outputHeight) const override;
+      int outputHeight) override;
 
   std::string name() const override { return "NVIDIA CUDA"; }
 
@@ -31,6 +26,4 @@ class CudaPreprocessor : public IPreprocessorBackend {
 
  private:
   int gpu_id_ = 0;
-  mutable std::vector<std::uint8_t> device_buffer_;
-  mutable size_t device_buffer_size_ = 0;
 };

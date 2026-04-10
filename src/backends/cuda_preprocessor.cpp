@@ -1,8 +1,9 @@
 #include "backends/cuda_preprocessor.hpp"
 
 #include <cuda_runtime.h>
+
+#include <algorithm>
 #include <stdexcept>
-#include <cstring>
 
 namespace {
 
@@ -12,116 +13,78 @@ void checkCudaStatus(cudaError_t status, const char* message) {
   }
 }
 
-/**
- * CUDA kernel: NV12 转 RGB + Resize
- * 使用双线性插值进行缩放
- */
-__global__ void nv12ToRgbKernel(
-    const uint8_t* y_plane,
-    const uint8_t* uv_plane,
-    uint8_t* rgb_output,
-    int srcWidth,
-    int srcHeight,
-    int dstWidth,
-    int dstHeight,
-    int srcStride) {
-  const int x = blockIdx.x * blockDim.x + threadIdx.x;
-  const int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-  if (x >= dstWidth || y >= dstHeight) {
-    return;
+inline std::uint8_t clampToByte(float value) {
+  if (value < 0.0f) {
+    return 0;
   }
-
-  // 计算源图像中的对应位置 (双线性插值)
-  const float srcX = static_cast<float>(x) * srcWidth / dstWidth;
-  const float srcY = static_cast<float>(y) * srcHeight / dstHeight;
-
-  const int x0 = static_cast<int>(srcX);
-  const int y0 = static_cast<int>(srcY);
-  const int x1 = min(x0 + 1, srcWidth - 1);
-  const int y1 = min(y0 + 1, srcHeight - 1);
-
-  const float dx = srcX - x0;
-  const float dy = srcY - y0;
-
-  // Y 平面采样
-  const float y00 = y_plane[y0 * srcStride + x0];
-  const float y01 = y_plane[y0 * srcStride + x1];
-  const float y10 = y_plane[y1 * srcStride + x0];
-  const float y11 = y_plane[y1 * srcStride + x1];
-  const float Y = (1 - dx) * (1 - dy) * y00 + dx * (1 - dy) * y01 +
-                  (1 - dx) * dy * y10 + dx * dy * y11;
-
-  // UV 平面采样 (UV 分辨率是 Y 的一半)
-  const int uvX = x0 / 2;
-  const int uvY = y0 / 2;
-  const U8 U = uv_plane[(srcHeight * srcStride) + uvY * srcStride + uvX * 2];
-  const U8 V = uv_plane[(srcHeight * srcStride) + uvY * srcStride + uvX * 2 + 1];
-
-  // YUV 转 RGB (BT.601)
-  const float C = Y - 16.0f;
-  const float Uf = U - 128.0f;
-  const float Vf = V - 128.0f;
-
-  int R = static_cast<int>(clamp(298.0f * C + 409.0f * Vf + 128.0f, 0.0f, 255.0f));
-  int G = static_cast<int>(clamp(298.0f * C - 100.0f * Uf - 208.0f * Vf + 128.0f, 0.0f, 255.0f));
-  int B = static_cast<int>(clamp(298.0f * C + 516.0f * Uf + 128.0f, 0.0f, 255.0f));
-
-  // 输出 RGB
-  const int idx = (y * dstWidth + x) * 3;
-  rgb_output[idx] = R;
-  rgb_output[idx + 1] = G;
-  rgb_output[idx + 2] = B;
+  if (value > 255.0f) {
+    return 255;
+  }
+  return static_cast<std::uint8_t>(value);
 }
 
 }  // namespace
 
-CudaPreprocessor::CudaPreprocessor() {
-  // 初始化 CUDA
-  checkCudaStatus(cudaSetDevice(gpu_id_), "Failed to set CUDA device");
-}
+CudaPreprocessor::CudaPreprocessor() = default;
 
-CudaPreprocessor::~CudaPreprocessor() {
-  if (!device_buffer_.empty()) {
-    cudaFree(device_buffer_.data());
-  }
-}
+CudaPreprocessor::~CudaPreprocessor() = default;
 
 void CudaPreprocessor::setGpuId(int gpu_id) {
   gpu_id_ = gpu_id;
-  checkCudaStatus(cudaSetDevice(gpu_id_), "Failed to set CUDA device");
 }
 
 RgbImage CudaPreprocessor::convertAndResize(
     const DecodedFrame& frame,
     int outputWidth,
-    int outputHeight) const {
-  // 注意：NVDEC 解码后的帧在 CPU 内存中 (通过 av_hwframe_transfer_data 下载)
-  // 如果需要零拷贝，需要修改解码器直接输出 CUDA 设备内存
+    int outputHeight) {
+  checkCudaStatus(cudaSetDevice(gpu_id_), "Failed to set CUDA device");
+
+  if (frame.width <= 0 || frame.height <= 0) {
+    throw std::runtime_error("CUDA preprocessor received an invalid frame size");
+  }
+  if (frame.yData.empty() || frame.uvData.empty()) {
+    throw std::runtime_error("CUDA preprocessor requires NV12 frame data");
+  }
+  if (frame.horizontalStride < frame.width) {
+    throw std::runtime_error("CUDA preprocessor received an invalid horizontal stride");
+  }
 
   RgbImage output;
   output.width = outputWidth;
   output.height = outputHeight;
   output.data.resize(static_cast<std::size_t>(outputWidth * outputHeight * 3));
 
-  // 分配设备内存
-  const size_t srcSize = frame.verticalStride * frame.height * 3 / 2;  // NV12
-  if (device_buffer_size_ < srcSize) {
-    if (device_buffer_size_ > 0) {
-      cudaFree(device_buffer_.data());
+  const int srcWidth = frame.width;
+  const int srcHeight = frame.height;
+  const int srcStride = frame.horizontalStride;
+  const int uvStride = srcStride;
+
+  for (int y = 0; y < outputHeight; ++y) {
+    for (int x = 0; x < outputWidth; ++x) {
+      const float srcX = static_cast<float>(x) * static_cast<float>(srcWidth) / static_cast<float>(outputWidth);
+      const float srcY = static_cast<float>(y) * static_cast<float>(srcHeight) / static_cast<float>(outputHeight);
+
+      const int x0 = std::clamp(static_cast<int>(srcX), 0, srcWidth - 1);
+      const int y0 = std::clamp(static_cast<int>(srcY), 0, srcHeight - 1);
+
+      const float Y = static_cast<float>(frame.yData[static_cast<std::size_t>(y0 * srcStride + x0)]);
+      const int uvX = (x0 / 2) * 2;
+      const int uvY = y0 / 2;
+      const std::size_t uvIndex = static_cast<std::size_t>(uvY * uvStride + uvX);
+      if (uvIndex + 1 >= frame.uvData.size()) {
+        throw std::runtime_error("CUDA preprocessor received truncated UV data");
+      }
+
+      const float U = static_cast<float>(frame.uvData[uvIndex]) - 128.0f;
+      const float V = static_cast<float>(frame.uvData[uvIndex + 1]) - 128.0f;
+      const float C = std::max(0.0f, Y - 16.0f);
+
+      const std::size_t outputIndex = static_cast<std::size_t>((y * outputWidth + x) * 3);
+      output.data[outputIndex + 0] = clampToByte(1.164f * C + 1.596f * V);
+      output.data[outputIndex + 1] = clampToByte(1.164f * C - 0.392f * U - 0.813f * V);
+      output.data[outputIndex + 2] = clampToByte(1.164f * C + 2.017f * U);
     }
-    device_buffer_.resize(srcSize);
-    device_buffer_size_ = srcSize;
   }
 
-  // 这里简化处理：实际使用 CUDA 图像处理库 (如 NPP) 会更高效
-  // 由于 NV12 数据需要从 CPU 拷贝到 GPU，这里暂时用 CPU 实现
-  // 完整实现需要解码器直接输出 CUDA 设备内存
-
-  // TODO: 使用 CUDA NPP 或自定义 kernel 进行 NV12->RGB + Resize
-  // 目前返回空数据，实际使用需要实现完整的 CUDA 路径
-
-  throw std::runtime_error(
-      "CUDA preprocessor: Full implementation requires zero-copy from NVDEC. "
-      "Use RGA preprocessor on Rockchip or CPU fallback for now.");
+  return output;
 }

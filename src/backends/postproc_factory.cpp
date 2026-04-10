@@ -1,17 +1,16 @@
+#include "backend_registry.hpp"
 #include "postproc_interface.hpp"
 #include "backends/yolo_postproc.hpp"
 
 #include <stdexcept>
 
 PostprocBackendType detectAvailablePostprocBackend() {
-  // 默认自动选择
-  return PostprocBackendType::kAuto;
+  return PostprocBackendType::kYoloV8;
 }
 
 std::unique_ptr<IPostprocessor> createPostprocBackend(PostprocBackendType type) {
   if (type == PostprocBackendType::kAuto) {
-    // 默认使用 YOLOv8
-    type = PostprocBackendType::kYoloV8;
+    type = detectAvailablePostprocBackend();
   }
 
   switch (type) {
@@ -21,7 +20,12 @@ std::unique_ptr<IPostprocessor> createPostprocBackend(PostprocBackendType type) 
     case PostprocBackendType::kYolo26:
       return std::make_unique<YoloPostprocessor>(YoloVersion::kYolo26);
 
+    case PostprocBackendType::kYoloV5:
+      return std::make_unique<YoloPostprocessor>(YoloVersion::kYolov8);
+
     default:
-      throw std::runtime_error("Unknown postproc backend type");
+      throw std::runtime_error(
+          "Postprocessor backend '" + toString(type) +
+          "' is not available in this build. Available: " + availablePostprocBackends());
   }
 }

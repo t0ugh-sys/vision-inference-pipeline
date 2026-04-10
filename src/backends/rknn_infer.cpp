@@ -37,8 +37,14 @@ void RknnInfer::open(const ModelConfig& config) {
 }
 
 std::vector<float> RknnInfer::infer(const RgbImage& image) {
+  if (context_ == 0) {
+    throw std::runtime_error("RKNN backend is not initialized");
+  }
   if (image.width != input_width_ || image.height != input_height_) {
     throw std::runtime_error("RGB image size does not match RKNN input tensor");
+  }
+  if (image.data.size() != static_cast<std::size_t>(input_width_ * input_height_ * input_channels_)) {
+    throw std::runtime_error("RGB image buffer size does not match RKNN input tensor");
   }
 
   // 准备输入数据
@@ -146,4 +152,5 @@ void RknnInfer::close() {
   input_width_ = 0;
   input_height_ = 0;
   input_channels_ = 0;
+  is_nhwc_ = true;
 }

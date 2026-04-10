@@ -1,17 +1,24 @@
+#include "backend_registry.hpp"
 #include "encoder_interface.hpp"
-#include "backends/nvenc_encoder.hpp"
-#include "backends/mpp_encoder.hpp"
 
 #include <stdexcept>
 
+#if defined(ENABLE_MPP_ENCODER)
+#include "backends/mpp_encoder.hpp"
+#endif
+
+#if defined(ENABLE_NVENC_ENCODER)
+#include "backends/nvenc_encoder.hpp"
+#endif
+
 EncoderBackendType detectAvailableEncoderBackend() {
-#ifdef NVIDIA_PLATFORM
+#if defined(ENABLE_NVENC_ENCODER)
   return EncoderBackendType::kNvidiaNvEnc;
-#endif
-#ifdef ROCKCHIP_PLATFORM
+#elif defined(ENABLE_MPP_ENCODER)
   return EncoderBackendType::kRockchipMpp;
+#else
+  return EncoderBackendType::kAuto;
 #endif
-  return EncoderBackendType::kCpu;
 }
 
 std::unique_ptr<IEncoderBackend> createEncoderBackend(EncoderBackendType type) {
@@ -20,17 +27,20 @@ std::unique_ptr<IEncoderBackend> createEncoderBackend(EncoderBackendType type) {
   }
 
   switch (type) {
+#if defined(ENABLE_NVENC_ENCODER)
     case EncoderBackendType::kNvidiaNvEnc:
       return std::make_unique<NvencEncoder>();
+#endif
 
+#if defined(ENABLE_MPP_ENCODER)
     case EncoderBackendType::kRockchipMpp:
       return std::make_unique<MppEncoder>();
+#endif
 
     case EncoderBackendType::kCpu:
-      // TODO: 实现 CPU 软编码
-      throw std::runtime_error("CPU encoder not yet implemented");
-
     default:
-      throw std::runtime_error("Unknown encoder backend type");
+      throw std::runtime_error(
+          "Encoder backend '" + toString(type) +
+          "' is not available in this build. Available: " + availableEncoderBackends());
   }
 }

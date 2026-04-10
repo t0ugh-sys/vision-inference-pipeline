@@ -4,16 +4,14 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
-#include <libavutil/pixfmt.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
+#include <libavutil/pixfmt.h>
 }
 
-#include <stdexcept>
 #include <cstring>
-
-#ifdef _WIN32
-#include <windows.h>
-#endif
+#include <memory>
+#include <stdexcept>
 
 namespace {
 
@@ -22,6 +20,21 @@ void checkAvStatus(int status, const char* message) {
     char err[AV_ERROR_MAX_STRING_SIZE];
     av_strerror(status, err, sizeof(err));
     throw std::runtime_error(std::string(message) + ": " + err);
+  }
+}
+
+void copyNv12Plane(
+    std::vector<std::uint8_t>& destination,
+    const std::uint8_t* source,
+    int sourceStride,
+    int widthInBytes,
+    int rows) {
+  destination.resize(static_cast<std::size_t>(widthInBytes * rows));
+  for (int row = 0; row < rows; ++row) {
+    std::memcpy(
+        destination.data() + static_cast<std::size_t>(row * widthInBytes),
+        source + static_cast<std::size_t>(row * sourceStride),
+        static_cast<std::size_t>(widthInBytes));
   }
 }
 
@@ -34,12 +47,7 @@ NvdecDecoder::~NvdecDecoder() {
 void NvdecDecoder::open(VideoCodec codec) {
   close();
 
-#ifdef _WIN32
-  // Windows: 使用 cuvid 解码器，不需要 CUDA 上下文
-  // FFmpeg 会自动使用 h264_cuvid/hevc_cuvid 解码器
-  (void)codec;
-#else
-  // Linux: 创建 CUDA 硬件设备上下文
+#ifndef _WIN32
   int ret = av_hwdevice_ctx_create(
       &hw_device_ctx_,
       AV_HWDEVICE_TYPE_CUDA,
@@ -49,9 +57,9 @@ void NvdecDecoder::open(VideoCodec codec) {
   checkAvStatus(ret, "Failed to create CUDA hardware device context");
 #endif
 
-  // 2. 查找解码器 (Windows: cuvid, Linux: h264_cuvid with CUDA)
 #ifdef _WIN32
-  const AVCodec* av_codec = avcodec_find_decoder_by_name("h264_cuvid");
+  const AVCodec* av_codec = avcodec_find_decoder_by_name(
+      codec == VideoCodec::kH265 ? "hevc_cuvid" : "h264_cuvid");
 #else
   const AVCodec* av_codec = avcodec_find_decoder(toAVCodec(codec));
 #endif
@@ -59,54 +67,39 @@ void NvdecDecoder::open(VideoCodec codec) {
     throw std::runtime_error("Codec not found");
   }
 
-  // 3. 创建编解码器上下文
   codec_ctx_ = avcodec_alloc_context3(av_codec);
   if (!codec_ctx_) {
     throw std::runtime_error("Failed to allocate codec context");
   }
 
 #ifndef _WIN32
-  // 4. 设置硬件加速 (Linux only)
   codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
   if (!codec_ctx_->hw_device_ctx) {
     throw std::runtime_error("Failed to reference hardware device context");
   }
 
-  // 5. 设置 CUDA 设备 ID
   if (gpu_id_ >= 0) {
     av_opt_set_int(codec_ctx_->hw_device_ctx->data, "cuda_device", gpu_id_, 0);
   }
 #endif
 
-  // 6. 设置输出格式为 NV12 (NVDEC 原生输出)
-  codec_ctx_->get_format = [](AVCodecContext* ctx, const AVPixelFormat* pix_fmts) {
-    for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+  codec_ctx_->get_format = [](AVCodecContext*, const AVPixelFormat* pixelFormats) {
+    for (const AVPixelFormat* current = pixelFormats; *current != AV_PIX_FMT_NONE; ++current) {
 #ifdef _WIN32
-      if (*p == AV_PIX_FMT_NV12) {
-        return *p;
+      if (*current == AV_PIX_FMT_NV12) {
+        return *current;
       }
 #else
-      if (*p == AV_PIX_FMT_CUDA) {
-        return *p;
+      if (*current == AV_PIX_FMT_CUDA) {
+        return *current;
       }
 #endif
     }
     return AV_PIX_FMT_NONE;
   };
 
-  // 7. 打开编解码器
-#ifdef _WIN32
-  int ret = avcodec_open2(codec_ctx_, av_codec, nullptr);
-#else
-  ret = avcodec_open2(codec_ctx_, av_codec, nullptr);
-#endif
+  const int ret = avcodec_open2(codec_ctx_, av_codec, nullptr);
   checkAvStatus(ret, "Failed to open codec");
-
-  // 8. 获取视频尺寸 (如果有)
-  if (codec_ctx_->width > 0 && codec_ctx_->height > 0) {
-    width_ = codec_ctx_->width;
-    height_ = codec_ctx_->height;
-  }
 }
 
 std::optional<DecodedFrame> NvdecDecoder::decode(const EncodedPacket& packet) {
@@ -148,21 +141,18 @@ void NvdecDecoder::submitPacket(const EncodedPacket& packet) {
   }
 
   if (!packet.endOfStream) {
-    av_packet->data = const_cast<uint8_t*>(packet.data.data());
+    av_packet->data = const_cast<std::uint8_t*>(packet.data.data());
     av_packet->size = static_cast<int>(packet.data.size());
     av_packet->pts = packet.pts;
     av_packet->flags = packet.keyFrame ? AV_PKT_FLAG_KEY : 0;
   } else {
-    // EOF 包
     av_packet->data = nullptr;
     av_packet->size = 0;
     eos_sent_ = true;
   }
 
-  // 发送包到解码器
-  int ret = avcodec_send_packet(codec_ctx_, av_packet);
+  const int ret = avcodec_send_packet(codec_ctx_, av_packet);
   av_packet_free(&av_packet);
-
   if (ret < 0 && ret != AVERROR(EAGAIN)) {
     checkAvStatus(ret, "Failed to send packet to decoder");
   }
@@ -183,42 +173,45 @@ std::optional<DecodedFrame> NvdecDecoder::receiveFrame() {
     av_frame_free(&frame);
     return std::nullopt;
   }
-
   if (ret < 0) {
     av_frame_free(&frame);
     checkAvStatus(ret, "Failed to receive frame from decoder");
   }
 
-  // 从 CUDA 硬件帧获取数据
   DecodedFrame output;
   output.width = frame->width;
   output.height = frame->height;
   output.horizontalStride = frame->linesize[0];
   output.verticalStride = frame->height;
+  output.chromaStride = frame->linesize[1] > 0 ? frame->linesize[1] : frame->linesize[0];
   output.pts = frame->pts;
+  output.dmaFd = -1;
 
-  // 如果是硬件帧，获取 DMA FD
-  if (frame->hw_frames_ctx) {
-    AVHWFramesContext* hw_frames_ctx = reinterpret_cast<AVHWFramesContext*>(frame->hw_frames_ctx->data);
-    AVFrame* hw_frame = frame;
-
-    // 创建软件帧来下载数据
-    AVFrame* sw_frame = av_frame_alloc();
-    if (sw_frame) {
-      sw_frame->format = AV_PIX_FMT_NV12;
-      ret = av_hwframe_transfer_data(sw_frame, hw_frame, 0);
-      if (ret >= 0) {
-        // 成功下载，但我们需要 FD 用于零拷贝
-        // 这里简化处理，实际使用时可能需要 CUDA IPC
-        output.dmaFd = -1;  // CPU 内存路径
-      }
-      av_frame_free(&sw_frame);
+  if (frame->format == AV_PIX_FMT_CUDA) {
+    AVFrame* retained_frame = av_frame_clone(frame);
+    if (!retained_frame) {
+      av_frame_free(&frame);
+      throw std::runtime_error("Failed to clone CUDA frame");
     }
+    output.isOnDevice = true;
+    output.deviceY = reinterpret_cast<std::uintptr_t>(retained_frame->data[0]);
+    output.deviceUv = reinterpret_cast<std::uintptr_t>(retained_frame->data[1]);
+    output.nativeHandle = std::shared_ptr<void>(
+        retained_frame,
+        [](void* handle) {
+          AVFrame* owned_frame = reinterpret_cast<AVFrame*>(handle);
+          av_frame_free(&owned_frame);
+        });
+  } else if (frame->format == AV_PIX_FMT_NV12) {
+    copyNv12Plane(output.yData, frame->data[0], frame->linesize[0], frame->width, frame->height);
+    copyNv12Plane(output.uvData, frame->data[1], frame->linesize[1], frame->width, frame->height / 2);
   } else {
-    // 软件帧 (不应该发生，但保留处理)
-    output.dmaFd = -1;
+    av_frame_free(&frame);
+    throw std::runtime_error("NVDEC decoder currently expects CUDA or NV12 output");
   }
 
+  width_ = output.width;
+  height_ = output.height;
   av_frame_free(&frame);
   return output;
 }

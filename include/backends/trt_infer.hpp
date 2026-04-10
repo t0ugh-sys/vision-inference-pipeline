@@ -36,6 +36,8 @@ class TrtInfer : public IInferenceBackend {
 
  private:
   void loadEngine(const std::string& path);
+  std::size_t getOutputElementCount() const;
+  void releaseBuffers();
   void close();
 
   int gpu_id_ = 0;
@@ -44,6 +46,12 @@ class TrtInfer : public IInferenceBackend {
   int input_width_ = 0;
   int input_height_ = 0;
   int input_channels_ = 3;
+  bool input_is_nchw_ = true;
   size_t input_binding_ = 0;
-  size_t input_size_ = 0;
+  size_t output_binding_ = 1;
+  std::size_t input_bytes_ = 0;
+  std::size_t output_elements_ = 0;
+  void* input_buffer_ = nullptr;
+  void* output_buffer_ = nullptr;
+  std::vector<std::uint8_t> host_input_buffer_;
 };

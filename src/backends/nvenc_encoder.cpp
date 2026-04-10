@@ -72,15 +72,6 @@ void NvencEncoder::init(const EncoderConfig& config) {
   av_opt_set(codecCtx_->priv_data, "preset", "p4", 0);      // 低延迟 preset
   av_opt_set(codecCtx_->priv_data, "tune", "ull", 0);        // ultra-low-latency
 
-  // 5. 设置硬件帧上下文
-  AVHWFramesContext* framesCtx = reinterpret_cast<AVHWFramesContext*>(
-      av_mallocz(sizeof(AVHWFramesContext)));
-  framesCtx->format = AV_PIX_FMT_CUDA;
-  framesCtx->sw_format = AV_PIX_FMT_BGR0;
-  framesCtx->width = config.width;
-  framesCtx->height = config.height;
-  framesCtx->hw_device_ctx = av_buffer_ref(hwDeviceCtx_);
-
   ret = avcodec_open2(codecCtx_, encoder, nullptr);
   checkAvStatus(ret, "Failed to open NVENC encoder");
 
@@ -96,6 +87,17 @@ void NvencEncoder::init(const EncoderConfig& config) {
   hwFrame_->format = AV_PIX_FMT_CUDA;
   hwFrame_->width = config.width;
   hwFrame_->height = config.height;
+  // 使用 hw_frames_ctx 替代 hw_device_ctx (FFmpeg 新版本)
+  AVHWFramesContext* framesCtx = reinterpret_cast<AVHWFramesContext*>(
+      av_mallocz(sizeof(AVHWFramesContext)));
+  framesCtx->format = AV_PIX_FMT_CUDA;
+  framesCtx->sw_format = AV_PIX_FMT_BGR0;
+  framesCtx->width = config.width;
+  framesCtx->height = config.height;
+  framesCtx->device_ctx = hwDeviceCtx_;
+  hwFrame_->hw_frames_ctx = av_buffer_create(
+      reinterpret_cast<uint8_t*>(framesCtx), sizeof(AVHWFramesContext),
+      nullptr, nullptr, 0);
 
   initialized_ = true;
 }

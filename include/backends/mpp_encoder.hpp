@@ -2,6 +2,8 @@
 
 #include "../encoder_interface.hpp"
 
+#include <fstream>
+
 /**
  * Rockchip MPP 硬件编码器
  */

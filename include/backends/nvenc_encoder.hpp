@@ -2,6 +2,11 @@
 
 #include "encoder_interface.hpp"
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/buffer.h>
+}
+
 /**
  * NVIDIA NVENC 硬件编码器
  * 使用 FFmpeg 的 NVENC API
@@ -25,6 +30,9 @@ class NvencEncoder : public IEncoderBackend {
   AVFrame* swFrame_ = nullptr;
   AVFrame* hwFrame_ = nullptr;
   AVBufferRef* hwDeviceCtx_ = nullptr;
+  AVBufferRef* hwFramesCtx_ = nullptr;
   FILE* outputFile_ = nullptr;
   bool initialized_ = false;
+  int width_ = 0;
+  int height_ = 0;
 };

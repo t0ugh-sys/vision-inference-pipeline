@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+include(CTest)
+
 # =============================================================================
 # 平台选择 (编译时指定)
 # =============================================================================
@@ -33,28 +35,64 @@ endif()
 # 后端选择 (可选，用于裁剪不需要的后端)
 # =============================================================================
 
-option(ENABLE_MPP_DECODER "Enable Rockchip MPP decoder" ON)
-option(ENABLE_NVDEC_DECODER "Enable NVIDIA NVDEC decoder" ON)
-option(ENABLE_RGA_PREPROC "Enable Rockchip RGA preprocessor" ON)
-option(ENABLE_CUDA_PREPROC "Enable NVIDIA CUDA preprocessor" ON)
-option(ENABLE_RKNN_INFER "Enable Rockchip RKNN inference" ON)
-option(ENABLE_TRT_INFER "Enable NVIDIA TensorRT inference" ON)
+if(NOT DEFINED CACHE{ENABLE_MPP_DECODER})
+    set(ENABLE_MPP_DECODER OFF CACHE BOOL "Enable Rockchip MPP decoder")
+endif()
+if(NOT DEFINED CACHE{ENABLE_NVDEC_DECODER})
+    set(ENABLE_NVDEC_DECODER ON CACHE BOOL "Enable NVIDIA NVDEC decoder")
+endif()
+if(NOT DEFINED CACHE{ENABLE_RGA_PREPROC})
+    set(ENABLE_RGA_PREPROC OFF CACHE BOOL "Enable Rockchip RGA preprocessor")
+endif()
+if(NOT DEFINED CACHE{ENABLE_CUDA_PREPROC})
+    set(ENABLE_CUDA_PREPROC OFF CACHE BOOL "Enable NVIDIA CUDA preprocessor")
+endif()
+if(NOT DEFINED CACHE{ENABLE_RKNN_INFER})
+    set(ENABLE_RKNN_INFER OFF CACHE BOOL "Enable Rockchip RKNN inference")
+endif()
+if(NOT DEFINED CACHE{ENABLE_TRT_INFER})
+    set(ENABLE_TRT_INFER ON CACHE BOOL "Enable NVIDIA TensorRT inference")
+endif()
 
 # 根据平台设置默认后端
 if(ROCKCHIP_PLATFORM)
-    set(ENABLE_MPP_DECODER ON)
-    set(ENABLE_RGA_PREPROC ON)
-    set(ENABLE_RKNN_INFER ON)
-    set(ENABLE_NVDEC_DECODER OFF)
-    set(ENABLE_CUDA_PREPROC OFF)
-    set(ENABLE_TRT_INFER OFF)
+    if(NOT DEFINED CACHE{ENABLE_MPP_DECODER})
+        set(ENABLE_MPP_DECODER ON CACHE BOOL "Enable Rockchip MPP decoder" FORCE)
+    endif()
+    if(NOT DEFINED CACHE{ENABLE_RGA_PREPROC})
+        set(ENABLE_RGA_PREPROC ON CACHE BOOL "Enable Rockchip RGA preprocessor" FORCE)
+    endif()
+    if(NOT DEFINED CACHE{ENABLE_RKNN_INFER})
+        set(ENABLE_RKNN_INFER ON CACHE BOOL "Enable Rockchip RKNN inference" FORCE)
+    endif()
+    if(NOT DEFINED CACHE{ENABLE_NVDEC_DECODER})
+        set(ENABLE_NVDEC_DECODER OFF CACHE BOOL "Enable NVIDIA NVDEC decoder" FORCE)
+    endif()
+    if(NOT DEFINED CACHE{ENABLE_CUDA_PREPROC})
+        set(ENABLE_CUDA_PREPROC OFF CACHE BOOL "Enable NVIDIA CUDA preprocessor" FORCE)
+    endif()
+    if(NOT DEFINED CACHE{ENABLE_TRT_INFER})
+        set(ENABLE_TRT_INFER OFF CACHE BOOL "Enable NVIDIA TensorRT inference" FORCE)
+    endif()
 elseif(NVIDIA_PLATFORM)
-    set(ENABLE_NVDEC_DECODER ON)
-    set(ENABLE_CUDA_PREPROC ON)
-    set(ENABLE_TRT_INFER ON)
-    set(ENABLE_MPP_DECODER OFF)
-    set(ENABLE_RGA_PREPROC OFF)
-    set(ENABLE_RKNN_INFER OFF)
+    if(NOT DEFINED CACHE{ENABLE_NVDEC_DECODER})
+        set(ENABLE_NVDEC_DECODER ON CACHE BOOL "Enable NVIDIA NVDEC decoder" FORCE)
+    endif()
+    if(NOT DEFINED CACHE{ENABLE_CUDA_PREPROC})
+        set(ENABLE_CUDA_PREPROC OFF CACHE BOOL "Enable NVIDIA CUDA preprocessor" FORCE)
+    endif()
+    if(NOT DEFINED CACHE{ENABLE_TRT_INFER})
+        set(ENABLE_TRT_INFER ON CACHE BOOL "Enable NVIDIA TensorRT inference" FORCE)
+    endif()
+    if(NOT DEFINED CACHE{ENABLE_MPP_DECODER})
+        set(ENABLE_MPP_DECODER OFF CACHE BOOL "Enable Rockchip MPP decoder" FORCE)
+    endif()
+    if(NOT DEFINED CACHE{ENABLE_RGA_PREPROC})
+        set(ENABLE_RGA_PREPROC OFF CACHE BOOL "Enable Rockchip RGA preprocessor" FORCE)
+    endif()
+    if(NOT DEFINED CACHE{ENABLE_RKNN_INFER})
+        set(ENABLE_RKNN_INFER OFF CACHE BOOL "Enable Rockchip RKNN inference" FORCE)
+    endif()
 endif()
 
 # =============================================================================
@@ -62,12 +100,58 @@ endif()
 # =============================================================================
 
 # FFmpeg (必需，用于解复用)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
-    libavformat
-    libavcodec
-    libavutil
-)
+# 优先使用 pkg-config，如果失败则使用手动配置
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+        libavformat
+        libavcodec
+        libavutil
+    )
+    message(STATUS "Using pkg-config for FFmpeg")
+else()
+    # 手动配置 FFmpeg (Windows)
+    set(FFMPEG_ROOT "D:/Software/ffmpeg/ffmpeg-8.1-full_build-shared" CACHE PATH "FFmpeg root directory")
+    
+    find_path(FFMPEG_INCLUDE_DIR libavcodec/avcodec.h
+        PATHS ${FFMPEG_ROOT}/include
+        NO_DEFAULT_PATH
+    )
+    find_path(FFMPEG_INCLUDE_DIR libavformat/avformat.h
+        PATHS ${FFMPEG_ROOT}/include
+        NO_DEFAULT_PATH
+    )
+    find_path(FFMPEG_INCLUDE_DIR libavutil/avutil.h
+        PATHS ${FFMPEG_ROOT}/include
+        NO_DEFAULT_PATH
+    )
+    
+    find_library(AVCODEC_LIBRARY NAMES avcodec libavcodec
+        PATHS ${FFMPEG_ROOT}/lib
+        NO_DEFAULT_PATH
+    )
+    find_library(AVFORMAT_LIBRARY NAMES avformat libavformat
+        PATHS ${FFMPEG_ROOT}/lib
+        NO_DEFAULT_PATH
+    )
+    find_library(AVUTIL_LIBRARY NAMES avutil libavutil
+        PATHS ${FFMPEG_ROOT}/lib
+        NO_DEFAULT_PATH
+    )
+    
+    message(STATUS "FFMPEG_ROOT: ${FFMPEG_ROOT}")
+    message(STATUS "AVCODEC_LIBRARY: ${AVCODEC_LIBRARY}")
+    message(STATUS "AVFORMAT_LIBRARY: ${AVFORMAT_LIBRARY}")
+    message(STATUS "AVUTIL_LIBRARY: ${AVUTIL_LIBRARY}")
+    
+    if(AVCODEC_LIBRARY AND AVFORMAT_LIBRARY AND AVUTIL_LIBRARY)
+        message(STATUS "Found FFmpeg libraries manually")
+        set(FFMPEG_LIBRARIES ${AVCODEC_LIBRARY} ${AVFORMAT_LIBRARY} ${AVUTIL_LIBRARY})
+        set(FFMPEG_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIR})
+    else()
+        message(FATAL_ERROR "Could not find FFmpeg libraries")
+    endif()
+endif()
 
 # OpenCV (可选，用于可视化)
 find_package(OpenCV QUIET)
@@ -130,6 +214,12 @@ if(ENABLE_CUDA_PREPROC OR ENABLE_NVDEC_DECODER OR NVIDIA_PLATFORM)
     find_package(CUDAToolkit QUIET)
     if(CUDAToolkit_FOUND)
         message(STATUS "CUDA found: ${CUDAToolkit_TARGET_DIR}")
+        if(ENABLE_CUDA_PREPROC)
+            if(WIN32 AND MINGW)
+                message(FATAL_ERROR "ENABLE_CUDA_PREPROC=ON requires an MSVC toolchain on Windows because nvcc needs cl.exe")
+            endif()
+            enable_language(CUDA)
+        endif()
     elseif(NVIDIA_PLATFORM)
         message(FATAL_ERROR "CUDA not found but PLATFORM=nvidia")
     endif()
@@ -137,12 +227,29 @@ endif()
 
 # TensorRT
 if(ENABLE_TRT_INFER)
+    if(WIN32 AND MINGW)
+        message(FATAL_ERROR "ENABLE_TRT_INFER=ON is not supported with MinGW on Windows; use an MSVC generator so TensorRT libraries and nvcc can link correctly")
+    endif()
     find_path(TENSORRT_INCLUDE_DIR NvInfer.h
-        PATHS /usr/include/x86_64-linux-gnu /usr/local/cuda/include /usr/include
+        PATHS 
+            ${TENSORRT_ROOT}/include
+            "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/include"
+            /usr/include/x86_64-linux-gnu
+            /usr/local/cuda/include
+            /usr/include
+        NO_DEFAULT_PATH
     )
-    find_library(TENSORRT_LIBRARY nvinfer
-        PATHS /usr/lib/x86_64-linux-gnu /usr/local/cuda/lib64 /usr/lib
+    find_library(TENSORRT_LIBRARY NAMES nvinfer libnvinfer
+        PATHS 
+            ${TENSORRT_ROOT}/lib
+            "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.0/lib/x64"
+            /usr/lib/x86_64-linux-gnu
+            /usr/local/cuda/lib64
+            /usr/lib
+        NO_DEFAULT_PATH
     )
+    message(STATUS "TENSORRT_INCLUDE_DIR: ${TENSORRT_INCLUDE_DIR}")
+    message(STATUS "TENSORRT_LIBRARY: ${TENSORRT_LIBRARY}")
     if(TENSORRT_INCLUDE_DIR AND TENSORRT_LIBRARY)
         message(STATUS "TensorRT found: ${TENSORRT_INCLUDE_DIR}")
     endif()
@@ -153,8 +260,11 @@ endif()
 # =============================================================================
 
 set(COMMON_SOURCES
+    src/app_config.cpp
+    src/backend_registry.cpp
     src/main.cpp
     src/ffmpeg_packet_source.cpp
+    src/pipeline_runner.cpp
 )
 
 set(DECODER_SOURCES "")
@@ -181,30 +291,32 @@ endif()
 if(ENABLE_NVDEC_DECODER)
     list(APPEND DECODER_SOURCES
         src/backends/nvdec_decoder.cpp
-        src/backends/decoder_factory.cpp
     )
     add_compile_definitions(ENABLE_NVDEC_DECODER)
 endif()
 
-# RGA 预处理
-if(ENABLE_RGA_PREPROC)
+# 解码器工厂 (不需要单独包含)
+list(APPEND DECODER_SOURCES
+    src/backends/decoder_factory.cpp
+)
+
+# RGA 预处理 - Windows 禁用 (Rockchip only)
+if(ENABLE_RGA_PREPROC AND FALSE)
     if(NOT RGA_INCLUDE_DIR OR NOT RGA_LIBRARY)
         message(WARNING "RGA preprocessor requested but not found, disabling")
     else()
         list(APPEND PREPROC_SOURCES
             src/backends/rga_preprocessor.cpp
-            src/backends/preproc_factory.cpp
         )
         add_compile_definitions(ENABLE_RGA_PREPROC)
     endif()
 endif()
 
-# CUDA 预处理
+# CUDA 预处理 - 启用
 if(ENABLE_CUDA_PREPROC)
     if(CUDAToolkit_FOUND)
         list(APPEND PREPROC_SOURCES
-            src/backends/cuda_preprocessor.cpp
-            src/backends/preproc_factory.cpp
+            src/backends/cuda_preprocessor.cu
         )
         add_compile_definitions(ENABLE_CUDA_PREPROC)
     else()
@@ -212,8 +324,13 @@ if(ENABLE_CUDA_PREPROC)
     endif()
 endif()
 
-# 推理后端
-if(ENABLE_RKNN_INFER)
+# 使用 CPU fallback 预处理
+list(APPEND PREPROC_SOURCES
+    src/backends/preproc_factory.cpp
+)
+
+# 推理后端 - 禁用 (Windows)
+if(ENABLE_RKNN_INFER AND FALSE)
     if(RKNN_INCLUDE_DIR AND RKNN_LIBRARY)
         list(APPEND INFER_SOURCES
             src/backends/rknn_infer.cpp
@@ -237,6 +354,11 @@ if(ENABLE_TRT_INFER)
     endif()
 endif()
 
+# 添加空的推理工厂以避免链接错误
+list(APPEND INFER_SOURCES
+    src/backends/infer_factory.cpp
+)
+
 # 后处理 (YOLO 后处理)
 list(APPEND POSTPROC_SOURCES
     src/backends/yolo_postproc.cpp
@@ -244,7 +366,7 @@ list(APPEND POSTPROC_SOURCES
 )
 
 # 编码器 (NVENC + MPP)
-if(ENABLE_NVDEC_DECODER)
+if(ENABLE_NVDEC_DECODER AND FALSE)
     list(APPEND ENCODER_SOURCES
         src/backends/nvenc_encoder.cpp
     )
@@ -252,7 +374,7 @@ if(ENABLE_NVDEC_DECODER)
 endif()
 
 # MPP 编码器
-if(ENABLE_MPP_DECODER)
+if(ENABLE_MPP_DECODER AND FALSE)
     list(APPEND ENCODER_SOURCES
         src/backends/mpp_encoder.cpp
     )
@@ -263,12 +385,17 @@ list(APPEND ENCODER_SOURCES
     src/backends/encoder_factory.cpp
 )
 
-# 可视化 (OpenCV)
+# 可视化 (OpenCV) - 禁用
 if(OpenCV_FOUND)
     list(APPEND VISUAL_SOURCES
         src/backends/opencv_visualizer.cpp
     )
     add_compile_definitions(ENABLE_VISUAL)
+else()
+    # 添加空的 stub 可视化器
+    list(APPEND VISUAL_SOURCES
+        src/backends/null_visualizer.cpp
+    )
 endif()
 
 # =============================================================================
@@ -285,7 +412,11 @@ add_executable(video_pipeline
     ${VISUAL_SOURCES}
 )
 
-target_include_directories(rk_video_pipeline PRIVATE
+if(ENABLE_CUDA_PREPROC AND CUDAToolkit_FOUND)
+    set_source_files_properties(src/backends/cuda_preprocessor.cu PROPERTIES LANGUAGE CUDA)
+endif()
+
+target_include_directories(video_pipeline PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${FFMPEG_INCLUDE_DIRS}
 )
@@ -306,9 +437,16 @@ if(CUDAToolkit_FOUND)
     target_include_directories(video_pipeline PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 endif()
 
-target_link_libraries(video_pipeline PRIVATE
-    PkgConfig::FFMPEG
-)
+if(TENSORRT_INCLUDE_DIR)
+    target_include_directories(video_pipeline PRIVATE ${TENSORRT_INCLUDE_DIR})
+endif()
+
+if(PkgConfig_FOUND)
+    target_link_libraries(video_pipeline PRIVATE PkgConfig::FFMPEG)
+else()
+    target_link_libraries(video_pipeline PRIVATE ${FFMPEG_LIBRARIES})
+    target_include_directories(video_pipeline PRIVATE ${FFMPEG_INCLUDE_DIRS})
+endif()
 
 if(OpenCV_FOUND)
     target_link_libraries(video_pipeline PRIVATE ${OpenCV_LIBS})
@@ -329,6 +467,10 @@ endif()
 
 if(CUDAToolkit_FOUND)
     target_link_libraries(video_pipeline PRIVATE CUDA::cudart)
+endif()
+
+if(TENSORRT_LIBRARY)
+    target_link_libraries(video_pipeline PRIVATE ${TENSORRT_LIBRARY})
 endif()
 
 # RPATH 设置
@@ -354,3 +496,18 @@ message(STATUS "Postproc: ON")
 message(STATUS "NVENC Encoder: ${ENABLE_NVENC_ENCODER}")
 message(STATUS "===========================")
 message(STATUS "")
+
+if(BUILD_TESTING)
+    add_executable(app_config_test
+        src/app_config.cpp
+        tests/app_config_test.cpp
+    )
+    if(MSVC)
+        set_property(TARGET app_config_test PROPERTY
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    target_include_directories(app_config_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    add_test(NAME app_config_test COMMAND $<TARGET_FILE:app_config_test>)
+endif()

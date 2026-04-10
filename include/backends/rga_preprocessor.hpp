@@ -9,10 +9,13 @@
  */
 class RgaPreprocessor : public IPreprocessorBackend {
  public:
+  RgaPreprocessor();
+  ~RgaPreprocessor() override;
+
   RgbImage convertAndResize(
       const DecodedFrame& frame,
       int outputWidth,
-      int outputHeight) const override;
+      int outputHeight) override;
 
   std::string name() const override { return "Rockchip RGA"; }
 };
