@@ -8,7 +8,7 @@ extern "C" {
 #include <rk_mpi.h>
 }
 
-#include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 
@@ -22,6 +22,18 @@ void checkMppStatus(MPP_RET status, const char* message) {
   if (status != MPP_OK) {
     throw std::runtime_error(message);
   }
+}
+
+MppCtx& asContext(void*& context) {
+  return reinterpret_cast<MppCtx&>(context);
+}
+
+MppApi*& asApi(void*& api) {
+  return reinterpret_cast<MppApi*&>(api);
+}
+
+MppBufferGroup& asBufferGroup(void*& group) {
+  return reinterpret_cast<MppBufferGroup&>(group);
 }
 
 struct MppFrameHolder {
@@ -43,14 +55,14 @@ MppDecoder::~MppDecoder() {
 void MppDecoder::open(VideoCodec codec) {
   close();
 
-  checkMppStatus(mpp_create(&context_, &api_), "mpp_create failed");
+  checkMppStatus(mpp_create(&asContext(context_), &asApi(api_)), "mpp_create failed");
   checkMppStatus(
-      mpp_init(context_, MPP_CTX_DEC, static_cast<MppCodingType>(toMppCodec(codec))),
+      mpp_init(asContext(context_), MPP_CTX_DEC, static_cast<MppCodingType>(toMppCodec(codec))),
       "mpp_init failed");
 
   RK_U32 splitMode = 1;
   checkMppStatus(
-      api_->control(context_, MPP_DEC_SET_PARSER_SPLIT_MODE, &splitMode),
+      asApi(api_)->control(asContext(context_), MPP_DEC_SET_PARSER_SPLIT_MODE, &splitMode),
       "MPP_DEC_SET_PARSER_SPLIT_MODE failed");
 
   eosSubmitted_ = false;
@@ -71,11 +83,11 @@ void MppDecoder::close() {
   readyFrames_.clear();
   eosSubmitted_ = false;
   if (externalBufferGroup_ != nullptr) {
-    mpp_buffer_group_put(externalBufferGroup_);
+    mpp_buffer_group_put(asBufferGroup(externalBufferGroup_));
     externalBufferGroup_ = nullptr;
   }
   if (context_ != nullptr) {
-    mpp_destroy(context_);
+    mpp_destroy(asContext(context_));
   }
   context_ = nullptr;
   api_ = nullptr;
@@ -91,7 +103,7 @@ void MppDecoder::submitPacket(const EncodedPacket& packet) {
       "mpp_packet_init failed");
 
   if (!packet.endOfStream && !packet.data.empty()) {
-    mpp_packet_set_pos(mppPacket, packet.data.data());
+    mpp_packet_set_pos(mppPacket, const_cast<std::uint8_t*>(packet.data.data()));
     mpp_packet_set_length(mppPacket, packet.data.size());
   }
   if (packet.endOfStream) {
@@ -102,7 +114,7 @@ void MppDecoder::submitPacket(const EncodedPacket& packet) {
 
   bool submitted = false;
   for (int attempt = 0; attempt < kMaxPutAttempts; ++attempt) {
-    const MPP_RET status = api_->decode_put_packet(context_, mppPacket);
+    const MPP_RET status = asApi(api_)->decode_put_packet(asContext(context_), mppPacket);
     if (status == MPP_OK) {
       submitted = true;
       break;
@@ -142,7 +154,7 @@ std::optional<DecodedFrame> MppDecoder::popReadyFrame() {
 std::optional<DecodedFrame> MppDecoder::decodeOneFrame() {
   while (true) {
     MppFrame frame = nullptr;
-    const MPP_RET status = api_->decode_get_frame(context_, &frame);
+    const MPP_RET status = asApi(api_)->decode_get_frame(asContext(context_), &frame);
     if (status != MPP_OK) {
       checkMppStatus(status, "decode_get_frame failed");
     }
@@ -197,25 +209,29 @@ void MppDecoder::handleInfoChange(void* opaqueFrame) {
   MppFrame frame = static_cast<MppFrame>(opaqueFrame);
 
   if (externalBufferGroup_ != nullptr) {
-    mpp_buffer_group_put(externalBufferGroup_);
+    mpp_buffer_group_put(asBufferGroup(externalBufferGroup_));
     externalBufferGroup_ = nullptr;
   }
 
   checkMppStatus(
-      mpp_buffer_group_get_internal(&externalBufferGroup_, MPP_BUFFER_TYPE_DRM),
+      mpp_buffer_group_get_internal(&asBufferGroup(externalBufferGroup_), MPP_BUFFER_TYPE_DRM),
       "mpp_buffer_group_get_internal failed");
 
-  const RK_U32 horStride = static_cast<RK_U32>(std::max(1, mpp_frame_get_hor_stride(frame)));
-  const RK_U32 verStride = static_cast<RK_U32>(std::max(1, mpp_frame_get_ver_stride(frame)));
-  const RK_U32 frameBytes = horStride * verStride * 3 / 2;
+  const RK_U32 horStride = static_cast<RK_U32>(mpp_frame_get_hor_stride(frame));
+  const RK_U32 verStride = static_cast<RK_U32>(mpp_frame_get_ver_stride(frame));
+  const RK_U32 safeHorStride = horStride == 0 ? static_cast<RK_U32>(1) : horStride;
+  const RK_U32 safeVerStride = verStride == 0 ? static_cast<RK_U32>(1) : verStride;
+  const RK_U32 frameBytes = safeHorStride * safeVerStride * 3 / 2;
   const RK_U32 frameCount = 12;
-  mpp_buffer_group_limit_config(externalBufferGroup_, frameBytes, frameCount);
+  checkMppStatus(
+      mpp_buffer_group_limit_config(asBufferGroup(externalBufferGroup_), frameBytes, frameCount),
+      "mpp_buffer_group_limit_config failed");
 
   checkMppStatus(
-      api_->control(context_, MPP_DEC_SET_EXT_BUF_GROUP, externalBufferGroup_),
+      asApi(api_)->control(asContext(context_), MPP_DEC_SET_EXT_BUF_GROUP, asBufferGroup(externalBufferGroup_)),
       "MPP_DEC_SET_EXT_BUF_GROUP failed");
   checkMppStatus(
-      api_->control(context_, MPP_DEC_SET_INFO_CHANGE_READY, nullptr),
+      asApi(api_)->control(asContext(context_), MPP_DEC_SET_INFO_CHANGE_READY, nullptr),
       "MPP_DEC_SET_INFO_CHANGE_READY failed");
 
   mpp_frame_deinit(&frame);

@@ -6,10 +6,6 @@
 #include <deque>
 #include <optional>
 
-typedef struct MppCtxImpl* MppCtx;
-typedef struct MppApi_t MppApi;
-typedef struct MppBufferGroupImpl* MppBufferGroup;
-
 class MppDecoder : public IDecoderBackend {
  public:
   MppDecoder() = default;
@@ -31,9 +27,9 @@ class MppDecoder : public IDecoderBackend {
   void drainFramesToReadyQueue();
   void handleInfoChange(void* frame);
 
-  MppCtx context_ = nullptr;
-  MppApi* api_ = nullptr;
-  MppBufferGroup externalBufferGroup_ = nullptr;
+  void* context_ = nullptr;
+  void* api_ = nullptr;
+  void* externalBufferGroup_ = nullptr;
   std::deque<DecodedFrame> readyFrames_;
   bool eosSubmitted_ = false;
 };
