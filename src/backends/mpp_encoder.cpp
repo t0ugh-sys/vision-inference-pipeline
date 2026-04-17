@@ -67,7 +67,9 @@ void MppEncoder::init(const EncoderConfig& config) {
     throw std::runtime_error("Failed to open output file: " + config.outputPath);
   }
 
-  checkMppStatus(mpp_buffer_group_get_internal(&bufferGroup_, MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE),
+  checkMppStatus(mpp_buffer_group_get_internal(
+                     &bufferGroup_,
+                     static_cast<MppBufferType>(MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE)),
                  "mpp_buffer_group_get_internal failed");
   checkMppStatus(mpp_buffer_get(bufferGroup_, &packetBuffer_, packetBufferSize(config)),
                  "mpp_buffer_get for output packet failed");

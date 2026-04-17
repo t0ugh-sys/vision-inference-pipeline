@@ -138,7 +138,9 @@ void RgaPreprocessor::ensureBufferGroup() {
     return;
   }
   MppBufferGroup group = nullptr;
-  if (mpp_buffer_group_get_internal(&group, MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE) != MPP_OK) {
+  if (mpp_buffer_group_get_internal(
+          &group,
+          static_cast<MppBufferType>(MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE)) != MPP_OK) {
     throw std::runtime_error("mpp_buffer_group_get_internal for RGA output failed");
   }
   if (mpp_buffer_group_limit_config(group, kRgaBufferGroupMaxBytes, kRgaBufferGroupLimit) != MPP_OK) {

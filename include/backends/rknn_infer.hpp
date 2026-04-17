@@ -2,7 +2,7 @@
 
 #include "infer_interface.hpp"
 #include "pipeline_types.hpp"
-#include "third_party/rknn/include/rknn_api.h"
+#include "rknn_api.h"
 
 #include <cstdint>
 #include <vector>

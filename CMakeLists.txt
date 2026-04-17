@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(CTest)
+find_package(Threads REQUIRED)
 
 set(PLATFORM "auto" CACHE STRING "Target platform: auto, rockchip, nvidia")
 set_property(CACHE PLATFORM PROPERTY STRINGS auto rockchip nvidia)
@@ -242,6 +243,7 @@ endif()
 if(TENSORRT_LIBRARY)
     target_link_libraries(video_pipeline PRIVATE ${TENSORRT_LIBRARY})
 endif()
+target_link_libraries(video_pipeline PRIVATE Threads::Threads)
 
 set_target_properties(video_pipeline PROPERTIES BUILD_RPATH "${PROJECT_RKNN_LIBRARY_DIR}" INSTALL_RPATH "${PROJECT_RKNN_LIBRARY_DIR}")
 

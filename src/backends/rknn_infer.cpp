@@ -1,6 +1,6 @@
 #include "backends/rknn_infer.hpp"
 
-#include "third_party/rknn/include/rknn_api.h"
+#include "rknn_api.h"
 
 #include <cstring>
 #include <fstream>
