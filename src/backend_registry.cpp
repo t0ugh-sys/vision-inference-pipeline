@@ -170,11 +170,14 @@ bool isCompiledIn(EncoderBackendType type) {
   switch (type) {
     case EncoderBackendType::kAuto:
       return true;
+#if defined(ENABLE_MPP_ENCODER)
+    case EncoderBackendType::kRockchipMpp:
+      return true;
+#endif
 #if defined(ENABLE_NVENC_ENCODER)
     case EncoderBackendType::kNvidiaNvEnc:
       return true;
 #endif
-    case EncoderBackendType::kRockchipMpp:
     case EncoderBackendType::kCpu:
       return false;
     default:
@@ -221,6 +224,9 @@ std::string availablePostprocBackends() {
 
 std::string availableEncoderBackends() {
   std::vector<EncoderBackendType> backends;
+#if defined(ENABLE_MPP_ENCODER)
+  backends.push_back(EncoderBackendType::kRockchipMpp);
+#endif
 #if defined(ENABLE_NVENC_ENCODER)
   backends.push_back(EncoderBackendType::kNvidiaNvEnc);
 #endif

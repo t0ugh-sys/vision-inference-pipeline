@@ -76,6 +76,29 @@ std::vector<std::int64_t> toShape(const rknn_tensor_attr& attr) {
 
 }  // namespace
 
+namespace {
+
+class RknnOutputGuard {
+ public:
+  RknnOutputGuard(rknn_context context, std::vector<rknn_output>& outputs)
+      : context_(context), outputs_(outputs), armed_(false) {}
+
+  void arm() { armed_ = true; }
+
+  ~RknnOutputGuard() {
+    if (armed_) {
+      rknn_outputs_release(context_, static_cast<uint32_t>(outputs_.size()), outputs_.data());
+    }
+  }
+
+ private:
+  rknn_context context_;
+  std::vector<rknn_output>& outputs_;
+  bool armed_;
+};
+
+}  // namespace
+
 RknnInfer::~RknnInfer() {
   close();
 }
@@ -123,8 +146,10 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
   for (std::size_t i = 0; i < outputs.size(); ++i) {
     outputs[i].want_float = output_templates_[i].dataType == TensorDataType::kFloat32 ? 1 : 0;
   }
+  RknnOutputGuard outputGuard(context_, outputs);
 
   checkRknnStatus(rknn_outputs_get(context_, outputs.size(), outputs.data(), nullptr), "rknn_outputs_get failed");
+  outputGuard.arm();
 
   InferenceOutput result = output_templates_;
   for (std::size_t i = 0; i < outputs.size(); ++i) {
@@ -137,8 +162,6 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
       result[i].data.assign(data, data + count);
     }
   }
-
-  rknn_outputs_release(context_, outputs.size(), outputs.data());
   return result;
 }
 

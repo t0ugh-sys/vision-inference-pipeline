@@ -74,6 +74,15 @@ bool testRejectUnknownOption() {
          expect(result.message.find("Unknown option: --unknown") != std::string::npos, "expected unknown option message");
 }
 
+bool testRejectMissingOptionValue() {
+  std::vector<std::string> arguments = {"video_pipeline", "--encoder-output"};
+  std::vector<char*> argv = makeArgv(arguments);
+  const ParseResult result = parseAppConfig(static_cast<int>(argv.size()), argv.data());
+  return expect(result.status == ParseStatus::kError, "expected missing option value to fail") &&
+         expect(result.message.find("Missing value for --encoder-output") != std::string::npos,
+                "expected missing option value message");
+}
+
 }  // namespace
 
 int main() {
@@ -82,5 +91,6 @@ int main() {
   ok = ok && testBackendAndPositionals();
   ok = ok && testRejectOddPositionals();
   ok = ok && testRejectUnknownOption();
+  ok = ok && testRejectMissingOptionValue();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -26,6 +26,10 @@ struct AppConfig {
   int inferWorkers = 1;
   int gpuId = 0;
   int maxFrames = 30;
+  std::string encoderOutput;
+  std::string encoderCodec = "h264";
+  int encoderBitrate = 4000000;
+  int encoderFps = 30;
 };
 
 enum class ParseStatus {

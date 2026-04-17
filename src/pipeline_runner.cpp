@@ -2,6 +2,7 @@
 
 #include "backend_registry.hpp"
 #include "decoder_interface.hpp"
+#include "encoder_interface.hpp"
 #include "ffmpeg_packet_source.hpp"
 #include "infer_interface.hpp"
 #include "postproc_interface.hpp"
@@ -158,24 +159,23 @@ void validateAppConfig(const AppConfig& config) {
   requireCompiledIn(config.inferBackend, "inference", isCompiledIn, availableInferBackends, toString);
   requireCompiledIn(config.postprocBackend, "postprocessor", isCompiledIn, availablePostprocBackends, toString);
 
-  const bool needsVisualization =
-      config.visual.display ||
-      !config.visual.outputVideo.empty() ||
-      !config.visual.outputRtsp.empty();
-  if (needsVisualization) {
+  if (!config.visual.outputVideo.empty() || !config.visual.outputRtsp.empty()) {
+    throw std::runtime_error(
+        "output-video/output-rtsp are disabled on the hardware-first path because they still depend on the OpenCV CPU visualizer. "
+        "Use --display only, or implement a dedicated hardware encoder sink.");
+  }
+
+  if (config.visual.display) {
     const auto visualizer = createVisualizer();
     if (!visualizer->isAvailable()) {
       throw std::runtime_error(
-          "Visualization output requested, but no visualizer backend is available in this build");
+          "Visualization display requested, but no visualizer backend is available in this build");
     }
   }
 }
 
 void runPipeline(const AppConfig& config) {
-  const bool needsVisualization =
-      config.visual.display ||
-      !config.visual.outputVideo.empty() ||
-      !config.visual.outputRtsp.empty();
+  const bool needsVisualization = config.visual.display;
   const bool needsDisplayFrame = needsVisualization || config.dumpFirstFrame;
 
   auto inferProbe = createInferBackend(config.inferBackend);
@@ -248,12 +248,17 @@ void runPipeline(const AppConfig& config) {
     try {
       std::unique_ptr<IVisualizer> visualizer;
       std::unique_ptr<IPreprocessorBackend> displayPreproc;
+      std::unique_ptr<IEncoderBackend> encoder;
       bool visualizerInitialized = false;
+      bool encoderInitialized = false;
       if (needsVisualization) {
         visualizer = createVisualizer();
       }
       if (needsDisplayFrame) {
         displayPreproc = createPreprocBackend(config.preprocBackend);
+      }
+      if (!config.encoderOutput.empty()) {
+        encoder = createEncoderBackend(EncoderBackendType::kAuto);
       }
 
       std::map<std::size_t, ProcessedFrame> pending;
@@ -271,6 +276,28 @@ void runPipeline(const AppConfig& config) {
           ProcessedFrame current = std::move(it->second);
           pending.erase(it);
           ++displayedCount;
+
+          if (encoder && !encoderInitialized && current.decodedFrame.dmaFd >= 0) {
+            EncoderConfig encCfg;
+            encCfg.outputPath = config.encoderOutput;
+            encCfg.codec = config.encoderCodec;
+            encCfg.bitrate = config.encoderBitrate;
+            encCfg.fps = config.encoderFps;
+            encCfg.width = current.decodedFrame.width;
+            encCfg.height = current.decodedFrame.height;
+            encCfg.horStride = current.decodedFrame.horizontalStride > 0
+                ? current.decodedFrame.horizontalStride
+                : current.decodedFrame.width;
+            encCfg.verStride = current.decodedFrame.verticalStride > 0
+                ? current.decodedFrame.verticalStride
+                : current.decodedFrame.height;
+            encCfg.inputFormat = PixelFormat::kNv12;
+            encoder->init(encCfg);
+            encoderInitialized = true;
+          }
+          if (encoder && encoderInitialized && current.decodedFrame.dmaFd >= 0) {
+            encoder->encodeDecodedFrame(current.decodedFrame, current.pts);
+          }
 
           double displayPreprocMs = 0.0;
           std::optional<RgbImage> displayImage;
@@ -291,8 +318,10 @@ void runPipeline(const AppConfig& config) {
             std::cout << " decode_ms=" << current.decodeMs
                       << " preproc_ms=" << current.preprocMs
                       << " infer_ms=" << current.inferMs
-                      << " post_ms=" << current.postprocMs
-                      << " display_preproc_ms=" << displayPreprocMs;
+                      << " post_ms=" << current.postprocMs;
+            if (needsDisplayFrame) {
+              std::cout << " display_preproc_ms=" << displayPreprocMs;
+            }
           }
           std::cout << "\n";
 
@@ -314,6 +343,9 @@ void runPipeline(const AppConfig& config) {
         }
       }
 
+      if (encoder && encoderInitialized) {
+        encoder->flush();
+      }
       if (visualizer) {
         visualizer->close();
       }

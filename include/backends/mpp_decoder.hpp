@@ -3,8 +3,15 @@
 #include "decoder_interface.hpp"
 #include "pipeline_types.hpp"
 
+extern "C" {
+#include <rk_type.h>
+}
+
 #include <deque>
 #include <optional>
+
+struct MppApi_t;
+typedef struct MppApi_t MppApi;
 
 class MppDecoder : public IDecoderBackend {
  public:
@@ -27,9 +34,9 @@ class MppDecoder : public IDecoderBackend {
   void drainFramesToReadyQueue();
   void handleInfoChange(void* frame);
 
-  void* context_ = nullptr;
-  void* api_ = nullptr;
-  void* externalBufferGroup_ = nullptr;
+  MppCtx context_ = nullptr;
+  MppApi* api_ = nullptr;
+  MppBufferGroup externalBufferGroup_ = nullptr;
   std::deque<DecodedFrame> readyFrames_;
   bool eosSubmitted_ = false;
 };
