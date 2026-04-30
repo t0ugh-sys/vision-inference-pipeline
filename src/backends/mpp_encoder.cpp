@@ -86,6 +86,14 @@ bool useNv21ForRgbEncode() {
   return value != nullptr && value[0] != '\0' && std::string(value) != "0";
 }
 
+bool lowLatencyEncodeRequested(bool rtspOutput) {
+  if (rtspOutput) {
+    return true;
+  }
+  const char* value = std::getenv("MPP_ENCODER_LOW_LATENCY");
+  return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+}
+
 void logMppRgbEncodeStep(const char* step) {
   if (!verboseMppRgbEncodeLogsEnabled()) {
     return;
@@ -335,6 +343,7 @@ void MppEncoder::init(const EncoderConfig& config) {
                  "MPP_SET_OUTPUT_TIMEOUT failed");
   logMppRgbEncodeStep("init_set_timeout_done");
   const int targetBitrate = config.bitrate > 0 ? config.bitrate : 4000000;
+  const bool lowLatencyEncode = lowLatencyEncodeRequested(rtspOutput_);
 
   if (config.codec == "hevc" || config.codec == "h265") {
     throw std::runtime_error("Struct-based Rockchip encoder init currently supports h264 output only");
@@ -384,11 +393,16 @@ void MppEncoder::init(const EncoderConfig& config) {
   mpp_enc_cfg_set_s32(config_, "rc:fqp_min_p", 10);
   mpp_enc_cfg_set_s32(config_, "rc:fqp_max_p", 45);
 
-  mpp_enc_cfg_set_s32(config_, "h264:profile", 100);
+  mpp_enc_cfg_set_s32(config_, "h264:profile", lowLatencyEncode ? 66 : 100);
   mpp_enc_cfg_set_s32(config_, "h264:level", (width_ >= 1920 || height_ >= 1080) ? 40 : 31);
-  mpp_enc_cfg_set_s32(config_, "h264:cabac_en", 1);
+  mpp_enc_cfg_set_s32(config_, "h264:cabac_en", lowLatencyEncode ? 0 : 1);
   mpp_enc_cfg_set_s32(config_, "h264:cabac_idc", 0);
-  mpp_enc_cfg_set_s32(config_, "h264:trans8x8", 1);
+  mpp_enc_cfg_set_s32(config_, "h264:trans8x8", lowLatencyEncode ? 0 : 1);
+
+  if (rtspOutput_) {
+    // Keep RTSP-oriented output easier to packetize and decode in real time.
+    mpp_enc_cfg_set_s32(config_, "rc:gop", std::max(1, (fpsNum_ + fpsDen_ - 1) / fpsDen_));
+  }
 
   checkMppStatus(api_->control(context_, MPP_ENC_SET_CFG, config_),
                  "MPP_ENC_SET_CFG failed");
