@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -11,9 +13,17 @@
 #include <stdexcept>
 
 namespace {
+using Clock = std::chrono::steady_clock;
+using Ms = std::chrono::duration<double, std::milli>;
+
 struct DenseLayout { int proposals = 0; int attributes = 0; bool transposed = false; };
 struct TensorView { const InferenceTensor* tensor = nullptr; int channels = 0; int height = 0; int width = 0; bool nchw = true; };
 struct BranchSummary { int boxCount = 0; int clsCount = 0; int scoreCount = 0; };
+struct TensorAccessor {
+  TensorView view;
+  const float* values = nullptr;
+  std::vector<float> ownedValues;
+};
 struct DenseOrientationStats {
   float bestScore = -1.0f;
   float classMin = std::numeric_limits<float>::infinity();
@@ -21,6 +31,11 @@ struct DenseOrientationStats {
 };
 constexpr std::size_t kMaxCandidatesBeforeNms = 8400;
 constexpr std::size_t kMaxDetectionsAfterNms = 50;
+
+bool postTimingEnabled() {
+  const char* value = std::getenv("YOLO_POSTPROC_TIMING");
+  return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+}
 
 const std::vector<std::string>& coco80Labels() {
   static const std::vector<std::string> labels = {
@@ -259,6 +274,94 @@ float tensorValueAt(const InferenceTensor& tensor, const TensorView& view, int c
   }
 }
 
+float tensorValueAt(const TensorAccessor& accessor, int c, int y, int x) {
+  const TensorView& view = accessor.view;
+  const std::size_t index = view.nchw
+      ? (static_cast<std::size_t>(c) * view.height + y) * view.width + x
+      : (static_cast<std::size_t>(y) * view.width + x) * view.channels + c;
+  return accessor.values[index];
+}
+
+std::size_t tensorIndexAt(const TensorView& view, int c, int y, int x) {
+  return view.nchw
+      ? (static_cast<std::size_t>(c) * view.height + y) * view.width + x
+      : (static_cast<std::size_t>(y) * view.width + x) * view.channels + c;
+}
+
+bool scoreAtLeastThresholdRaw(const InferenceTensor& tensor, const TensorView& view, int y, int x, float threshold) {
+  const std::size_t index = tensorIndexAt(view, 0, y, x);
+  switch (tensor.dataType) {
+    case TensorDataType::kInt8:
+      if (tensor.quantization == TensorQuantizationType::kAffineAsymmetric && tensor.scale > 0.0f) {
+        const auto* raw = reinterpret_cast<const std::int8_t*>(tensor.rawData.data());
+        const int rawThreshold = static_cast<int>(std::ceil(threshold / tensor.scale + tensor.zeroPoint));
+        return static_cast<int>(raw[index]) >= rawThreshold;
+      }
+      break;
+    case TensorDataType::kUint8:
+      if (tensor.quantization == TensorQuantizationType::kAffineAsymmetric && tensor.scale > 0.0f) {
+        const int rawThreshold = static_cast<int>(std::ceil(threshold / tensor.scale + tensor.zeroPoint));
+        return static_cast<int>(tensor.rawData[index]) >= rawThreshold;
+      }
+      break;
+    default:
+      break;
+  }
+  return false;
+}
+
+bool bestClassRawAffine(
+    const InferenceTensor& tensor,
+    const TensorView& view,
+    int y,
+    int x,
+    float confThreshold,
+    int* bestClass,
+    float* bestScore) {
+  if (tensor.quantization != TensorQuantizationType::kAffineAsymmetric || tensor.scale <= 0.0f) {
+    return false;
+  }
+
+  const int rawThreshold = static_cast<int>(std::ceil(confThreshold / tensor.scale + tensor.zeroPoint));
+  int bestRaw = std::numeric_limits<int>::min();
+  int bestRawClass = 0;
+  switch (tensor.dataType) {
+    case TensorDataType::kInt8: {
+      const auto* raw = reinterpret_cast<const std::int8_t*>(tensor.rawData.data());
+      for (int c = 0; c < view.channels; ++c) {
+        const int value = static_cast<int>(raw[tensorIndexAt(view, c, y, x)]);
+        if (value > bestRaw) {
+          bestRaw = value;
+          bestRawClass = c;
+        }
+      }
+      break;
+    }
+    case TensorDataType::kUint8: {
+      for (int c = 0; c < view.channels; ++c) {
+        const int value = static_cast<int>(tensor.rawData[tensorIndexAt(view, c, y, x)]);
+        if (value > bestRaw) {
+          bestRaw = value;
+          bestRawClass = c;
+        }
+      }
+      break;
+    }
+    default:
+      return false;
+  }
+
+  if (bestRaw < rawThreshold) {
+    *bestScore = (static_cast<float>(bestRaw - tensor.zeroPoint) * tensor.scale);
+    *bestClass = bestRawClass;
+    return true;
+  }
+
+  *bestClass = bestRawClass;
+  *bestScore = static_cast<float>(bestRaw - tensor.zeroPoint) * tensor.scale;
+  return true;
+}
+
 void clampBoxes(std::vector<BoundingBox>& boxes, int originalWidth, int originalHeight) {
   for (auto& box : boxes) {
     box.x1 = std::clamp(box.x1, 0.0f, static_cast<float>(originalWidth - 1));
@@ -333,7 +436,13 @@ std::vector<float> YoloPostprocessor::valuesAsFloat(const InferenceTensor& tenso
       const auto* raw = reinterpret_cast<const std::int8_t*>(tensor.rawData.data());
       for (std::size_t i = 0; i < count; ++i) {
         const int v = raw[i];
-        values[i] = tensor.quantization == TensorQuantizationType::kAffineAsymmetric ? (static_cast<float>(v - tensor.zeroPoint) * tensor.scale) : static_cast<float>(v);
+        if (tensor.quantization == TensorQuantizationType::kAffineAsymmetric) {
+          values[i] = static_cast<float>(v - tensor.zeroPoint) * tensor.scale;
+        } else if (tensor.quantization == TensorQuantizationType::kDfp) {
+          values[i] = std::ldexp(static_cast<float>(v), -tensor.zeroPoint);
+        } else {
+          values[i] = static_cast<float>(v);
+        }
       }
       break;
     }
@@ -342,7 +451,13 @@ std::vector<float> YoloPostprocessor::valuesAsFloat(const InferenceTensor& tenso
       values.resize(count);
       for (std::size_t i = 0; i < count; ++i) {
         const int v = tensor.rawData[i];
-        values[i] = tensor.quantization == TensorQuantizationType::kAffineAsymmetric ? (static_cast<float>(v - tensor.zeroPoint) * tensor.scale) : static_cast<float>(v);
+        if (tensor.quantization == TensorQuantizationType::kAffineAsymmetric) {
+          values[i] = static_cast<float>(v - tensor.zeroPoint) * tensor.scale;
+        } else if (tensor.quantization == TensorQuantizationType::kDfp) {
+          values[i] = std::ldexp(static_cast<float>(v), -tensor.zeroPoint);
+        } else {
+          values[i] = static_cast<float>(v);
+        }
       }
       break;
     }
@@ -600,11 +715,12 @@ DetectionResult YoloPostprocessor::postprocessDenseTensor(const InferenceTensor&
 }
 
 DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutput& output, const RgbImage& modelInput, int originalWidth, int originalHeight, int64_t pts) const {
+  const auto totalStart = Clock::now();
   struct Branch {
-    InferenceTensor box;
-    InferenceTensor cls;
-    InferenceTensor scoreSum;
-    std::vector<InferenceTensor> aux;
+    const InferenceTensor* box = nullptr;
+    const InferenceTensor* cls = nullptr;
+    const InferenceTensor* scoreSum = nullptr;
+    std::vector<const InferenceTensor*> aux;
     bool hasBox = false;
     bool hasCls = false;
     bool hasScoreSum = false;
@@ -617,24 +733,25 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
     if (!buildTensorView(tensor, view)) continue;
     auto& branch = branches[{view.height, view.width}];
     if (!branch.hasBox && (view.channels == 4 || (view.channels % 4 == 0 && view.channels <= 64))) {
-      branch.box = tensor;
+      branch.box = &tensor;
       branch.hasBox = true;
       continue;
     }
     if (!branch.hasCls && view.channels == expectedClassChannels) {
-      branch.cls = tensor;
+      branch.cls = &tensor;
       branch.hasCls = true;
       continue;
     }
     if (!branch.hasScoreSum && view.channels == 1) {
-      branch.scoreSum = tensor;
+      branch.scoreSum = &tensor;
       branch.hasScoreSum = true;
       continue;
     }
-    branch.aux.push_back(tensor);
+    branch.aux.push_back(&tensor);
   }
 
   std::vector<BoundingBox> boxes;
+  const auto scanStart = Clock::now();
   for (auto& [_, branch] : branches) {
     if (!branch.hasBox) continue;
     if (!branch.hasCls) {
@@ -647,50 +764,168 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
       }
     }
 
-    TensorView boxView{};
-    TensorView clsView{};
-    TensorView scoreSumView{};
-    if (!buildTensorView(branch.box, boxView) || !buildTensorView(branch.cls, clsView)) continue;
-    if (branch.hasScoreSum && !buildTensorView(branch.scoreSum, scoreSumView)) continue;
+    TensorAccessor boxAccessor{};
+    TensorAccessor clsAccessor{};
+    TensorAccessor scoreSumAccessor{};
+    if (!buildTensorView(*branch.box, boxAccessor.view) || !buildTensorView(*branch.cls, clsAccessor.view)) continue;
+    if (branch.hasScoreSum && !buildTensorView(*branch.scoreSum, scoreSumAccessor.view)) continue;
+    boxAccessor.values = branch.box->data.empty()
+        ? (boxAccessor.ownedValues = valuesAsFloat(*branch.box)).data()
+        : branch.box->data.data();
+    clsAccessor.values = branch.cls->data.empty()
+        ? (clsAccessor.ownedValues = valuesAsFloat(*branch.cls)).data()
+        : branch.cls->data.data();
+    if (branch.hasScoreSum) {
+      scoreSumAccessor.values = branch.scoreSum->data.empty()
+          ? (scoreSumAccessor.ownedValues = valuesAsFloat(*branch.scoreSum)).data()
+          : branch.scoreSum->data.data();
+    }
 
-    const auto& labels = labelsForClassCount(clsView.channels);
-    const float strideX = static_cast<float>(modelInput.width) / static_cast<float>(boxView.width);
-    const float strideY = static_cast<float>(modelInput.height) / static_cast<float>(boxView.height);
+    const std::size_t boxPlaneSize =
+        static_cast<std::size_t>(boxAccessor.view.height) * static_cast<std::size_t>(boxAccessor.view.width);
+    const std::size_t clsPlaneSize =
+        static_cast<std::size_t>(clsAccessor.view.height) * static_cast<std::size_t>(clsAccessor.view.width);
+    const bool fastClsInt8 =
+        clsAccessor.view.nchw &&
+        branch.cls->quantization == TensorQuantizationType::kAffineAsymmetric &&
+        branch.cls->data.empty() &&
+        branch.cls->dataType == TensorDataType::kInt8;
+    const bool fastClsUint8 =
+        clsAccessor.view.nchw &&
+        branch.cls->quantization == TensorQuantizationType::kAffineAsymmetric &&
+        branch.cls->data.empty() &&
+        branch.cls->dataType == TensorDataType::kUint8;
+    const auto* clsRawI8 = fastClsInt8
+        ? reinterpret_cast<const std::int8_t*>(branch.cls->rawData.data())
+        : nullptr;
+    const auto* clsRawU8 = fastClsUint8 ? branch.cls->rawData.data() : nullptr;
+    const int clsRawThreshold = branch.cls->scale > 0.0f
+        ? static_cast<int>(std::ceil(options_.confThreshold / branch.cls->scale + branch.cls->zeroPoint))
+        : std::numeric_limits<int>::max();
 
-    for (int y = 0; y < boxView.height; ++y) {
-      for (int x = 0; x < boxView.width; ++x) {
+    const bool fastScoreInt8 =
+        branch.hasScoreSum &&
+        scoreSumAccessor.view.nchw &&
+        branch.scoreSum->quantization == TensorQuantizationType::kAffineAsymmetric &&
+        branch.scoreSum->data.empty() &&
+        branch.scoreSum->dataType == TensorDataType::kInt8;
+    const bool fastScoreUint8 =
+        branch.hasScoreSum &&
+        scoreSumAccessor.view.nchw &&
+        branch.scoreSum->quantization == TensorQuantizationType::kAffineAsymmetric &&
+        branch.scoreSum->data.empty() &&
+        branch.scoreSum->dataType == TensorDataType::kUint8;
+    const auto* scoreRawI8 = fastScoreInt8
+        ? reinterpret_cast<const std::int8_t*>(branch.scoreSum->rawData.data())
+        : nullptr;
+    const auto* scoreRawU8 = fastScoreUint8 ? branch.scoreSum->rawData.data() : nullptr;
+    const int scoreRawThreshold =
+        branch.hasScoreSum && branch.scoreSum->scale > 0.0f
+            ? static_cast<int>(std::ceil(options_.confThreshold / branch.scoreSum->scale + branch.scoreSum->zeroPoint))
+            : std::numeric_limits<int>::max();
+
+    const bool fastBox4Int8 =
+        boxAccessor.view.channels == 4 &&
+        boxAccessor.view.nchw &&
+        branch.box->quantization == TensorQuantizationType::kAffineAsymmetric &&
+        branch.box->data.empty() &&
+        branch.box->dataType == TensorDataType::kInt8;
+    const bool fastBox4Uint8 =
+        boxAccessor.view.channels == 4 &&
+        boxAccessor.view.nchw &&
+        branch.box->quantization == TensorQuantizationType::kAffineAsymmetric &&
+        branch.box->data.empty() &&
+        branch.box->dataType == TensorDataType::kUint8;
+    const auto* boxRawI8 = fastBox4Int8
+        ? reinterpret_cast<const std::int8_t*>(branch.box->rawData.data())
+        : nullptr;
+    const auto* boxRawU8 = fastBox4Uint8 ? branch.box->rawData.data() : nullptr;
+
+    const auto& labels = labelsForClassCount(clsAccessor.view.channels);
+    const float strideX = static_cast<float>(modelInput.width) / static_cast<float>(boxAccessor.view.width);
+    const float strideY = static_cast<float>(modelInput.height) / static_cast<float>(boxAccessor.view.height);
+
+    for (int y = 0; y < boxAccessor.view.height; ++y) {
+      for (int x = 0; x < boxAccessor.view.width; ++x) {
+        const std::size_t spatialIndex =
+            static_cast<std::size_t>(y) * static_cast<std::size_t>(boxAccessor.view.width) + static_cast<std::size_t>(x);
         // Official RKNN YOLOv8 uses the optional 1-channel branch as score_sum
         // for early rejection only. The final detection score is the best class score.
         if (branch.hasScoreSum) {
-          const float scoreSum = tensorValueAt(branch.scoreSum, scoreSumView, 0, y, x);
-          if (scoreSum < options_.confThreshold) {
-            continue;
+          if (fastScoreInt8) {
+            if (static_cast<int>(scoreRawI8[spatialIndex]) < scoreRawThreshold) {
+              continue;
+            }
+          } else if (fastScoreUint8) {
+            if (static_cast<int>(scoreRawU8[spatialIndex]) < scoreRawThreshold) {
+              continue;
+            }
+          } else {
+            float scoreSum = tensorValueAt(scoreSumAccessor, 0, y, x);
+            if (scoreAtLeastThresholdRaw(*branch.scoreSum, scoreSumAccessor.view, y, x, options_.confThreshold)) {
+              scoreSum = options_.confThreshold;
+            }
+            if (scoreSum < options_.confThreshold) {
+              continue;
+            }
           }
         }
         float bestScore = 0.0f;
         int bestClass = 0;
-        for (int c = 0; c < clsView.channels; ++c) {
-          float cls = tensorValueAt(branch.cls, clsView, c, y, x);
-          if (cls > bestScore) { bestScore = cls; bestClass = c; }
+        if (fastClsInt8) {
+          int bestRaw = std::numeric_limits<int>::min();
+          for (int c = 0; c < clsAccessor.view.channels; ++c) {
+            const int value = static_cast<int>(clsRawI8[static_cast<std::size_t>(c) * clsPlaneSize + spatialIndex]);
+            if (value > bestRaw) {
+              bestRaw = value;
+              bestClass = c;
+            }
+          }
+          bestScore = static_cast<float>(bestRaw - branch.cls->zeroPoint) * branch.cls->scale;
+        } else if (fastClsUint8) {
+          int bestRaw = std::numeric_limits<int>::min();
+          for (int c = 0; c < clsAccessor.view.channels; ++c) {
+            const int value = static_cast<int>(clsRawU8[static_cast<std::size_t>(c) * clsPlaneSize + spatialIndex]);
+            if (value > bestRaw) {
+              bestRaw = value;
+              bestClass = c;
+            }
+          }
+          bestScore = static_cast<float>(bestRaw - branch.cls->zeroPoint) * branch.cls->scale;
+        } else if (!bestClassRawAffine(*branch.cls, clsAccessor.view, y, x, options_.confThreshold, &bestClass, &bestScore)) {
+          for (int c = 0; c < clsAccessor.view.channels; ++c) {
+            const float cls = tensorValueAt(clsAccessor, c, y, x);
+            if (cls > bestScore) { bestScore = cls; bestClass = c; }
+          }
         }
         if (bestScore < options_.confThreshold) continue;
         float left = 0.0f, top = 0.0f, right = 0.0f, bottom = 0.0f;
-        if (boxView.channels == 4) {
-          left = tensorValueAt(branch.box, boxView, 0, y, x);
-          top = tensorValueAt(branch.box, boxView, 1, y, x);
-          right = tensorValueAt(branch.box, boxView, 2, y, x);
-          bottom = tensorValueAt(branch.box, boxView, 3, y, x);
+        if (fastBox4Int8) {
+          left = static_cast<float>(boxRawI8[spatialIndex] - branch.box->zeroPoint) * branch.box->scale;
+          top = static_cast<float>(boxRawI8[boxPlaneSize + spatialIndex] - branch.box->zeroPoint) * branch.box->scale;
+          right = static_cast<float>(boxRawI8[boxPlaneSize * 2 + spatialIndex] - branch.box->zeroPoint) * branch.box->scale;
+          bottom = static_cast<float>(boxRawI8[boxPlaneSize * 3 + spatialIndex] - branch.box->zeroPoint) * branch.box->scale;
+        } else if (fastBox4Uint8) {
+          left = static_cast<float>(boxRawU8[spatialIndex] - branch.box->zeroPoint) * branch.box->scale;
+          top = static_cast<float>(boxRawU8[boxPlaneSize + spatialIndex] - branch.box->zeroPoint) * branch.box->scale;
+          right = static_cast<float>(boxRawU8[boxPlaneSize * 2 + spatialIndex] - branch.box->zeroPoint) * branch.box->scale;
+          bottom = static_cast<float>(boxRawU8[boxPlaneSize * 3 + spatialIndex] - branch.box->zeroPoint) * branch.box->scale;
+        } else if (boxAccessor.view.channels == 4) {
+          left = tensorValueAt(boxAccessor, 0, y, x);
+          top = tensorValueAt(boxAccessor, 1, y, x);
+          right = tensorValueAt(boxAccessor, 2, y, x);
+          bottom = tensorValueAt(boxAccessor, 3, y, x);
         } else {
-          const int bins = boxView.channels / 4;
+          const int bins = boxAccessor.view.channels / 4;
           auto decode = [&](int base) {
             float maxLogit = -std::numeric_limits<float>::infinity();
             for (int i = 0; i < bins; ++i) {
-              maxLogit = std::max(maxLogit, tensorValueAt(branch.box, boxView, base + i, y, x));
+              maxLogit = std::max(maxLogit, tensorValueAt(boxAccessor, base + i, y, x));
             }
             float denominator = 0.0f;
             float numerator = 0.0f;
             for (int i = 0; i < bins; ++i) {
-              const float prob = std::exp(tensorValueAt(branch.box, boxView, base + i, y, x) - maxLogit);
+              const float prob = std::exp(tensorValueAt(boxAccessor, base + i, y, x) - maxLogit);
               denominator += prob;
               numerator += prob * static_cast<float>(i);
             }
@@ -708,7 +943,9 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
       }
     }
   }
+  const double scanMs = Ms(Clock::now() - scanStart).count();
 
+  const auto nmsStart = Clock::now();
   if (boxes.size() > kMaxCandidatesBeforeNms) {
     std::partial_sort(
         boxes.begin(),
@@ -722,7 +959,21 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
   if (boxes.size() > kMaxDetectionsAfterNms) {
     boxes.resize(kMaxDetectionsAfterNms);
   }
+  const double nmsMs = Ms(Clock::now() - nmsStart).count();
+  const auto mapStart = Clock::now();
   mapBoxesToOriginal(boxes, modelInput, originalWidth, originalHeight);
+  const double mapMs = Ms(Clock::now() - mapStart).count();
+  if (options_.verbose && postTimingEnabled() && !branchTimingLogged_) {
+    std::cerr << "[POST] branch timing"
+              << " branches=" << branches.size()
+              << " candidates=" << boxes.size()
+              << " scan_ms=" << scanMs
+              << " nms_ms=" << nmsMs
+              << " map_ms=" << mapMs
+              << " total_ms=" << Ms(Clock::now() - totalStart).count()
+              << "\n";
+    branchTimingLogged_ = true;
+  }
   return DetectionResult{pts, std::move(boxes), originalWidth, originalHeight};
 }
 

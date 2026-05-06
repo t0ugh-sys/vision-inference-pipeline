@@ -20,6 +20,7 @@ struct EncoderConfig {
   int fpsDen = 1;
   int bitrate = 0;
   std::string codec = "h264";
+  int lowLatency = -1;
 };
 
 class IEncoderBackend {

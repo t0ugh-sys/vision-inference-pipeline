@@ -167,12 +167,13 @@ ParseResult parseAppConfig(int argc, char* argv[]) {
       if (argument == "--encoder-codec") { config.encoderCodec = parseEncoderCodec(requireNextArg(argc, argv, index, "--encoder-codec")); continue; }
       if (argument == "--encoder-bitrate") { config.encoderBitrate = parseIntValue(requireNextArg(argc, argv, index, "--encoder-bitrate"), "--encoder-bitrate"); continue; }
       if (argument == "--encoder-fps") { config.encoderFps = parseIntValue(requireNextArg(argc, argv, index, "--encoder-fps"), "--encoder-fps"); continue; }
+      if (argument == "--encoder-low-latency") { config.encoderLowLatency = parseBoolValue(requireNextArg(argc, argv, index, "--encoder-low-latency"), "--encoder-low-latency") ? 1 : 0; continue; }
       if (!argument.empty() && argument[0] == '-') throw std::runtime_error("Unknown option: " + argument);
       positionals.push_back(argument);
     }
     assignPositionals(positionals, config);
-    if (config.inferWorkers <= 0) {
-      throw std::runtime_error("--infer-workers must be greater than 0");
+    if (config.inferWorkers < 0) {
+      throw std::runtime_error("--infer-workers must be greater than or equal to 0");
     }
     if (config.progressEvery <= 0) {
       throw std::runtime_error("--progress-every must be greater than 0");
@@ -189,7 +190,7 @@ std::string buildUsageMessage(const std::string& programName) {
   message += "Options:\n";
   message += "  --backend <rockchip|mpp|nvidia|nvdec>  Select backend preset\n";
   message += "  --gpu <id>                              GPU device id\n";
-  message += "  --infer-workers <n>                     Number of parallel inference workers\n";
+  message += "  --infer-workers <n>                     Number of parallel inference workers (default: 0 = auto; Rockchip=3, others=1)\n";
   message += "  --progress-every <n>                    Print one progress log every n frames (default: 30)\n";
   message += "  --rknn-core-mask <mask>                 auto|0|1|2|0_1|0_2|1_2|0_1_2|all\n";
   message += "  --max-frames <n>                        Max frames to process (default: 0 = unlimited)\n";
@@ -213,6 +214,7 @@ std::string buildUsageMessage(const std::string& programName) {
   message += "  --encoder-codec <h264|h265>             Encoder codec (default: h264; Rockchip output currently h264 only)\n";
   message += "  --encoder-bitrate <bps>                 Encoder bitrate (default: 0 = auto)\n";
   message += "  --encoder-fps <n>                       Encoder fps (default: 0 = source fps)\n";
+  message += "  --encoder-low-latency <true|false>      Low-latency encoder profile (default: auto; RTSP=true)\n";
   message += "  -h, --help                              Show this help message\n";
   return message;
 }

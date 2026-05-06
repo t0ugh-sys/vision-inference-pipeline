@@ -94,6 +94,7 @@ bool testRockchipStableOutputFlags() {
       "--rknn-zero-copy", "false",
       "--progress-every", "300",
       "--encoder-fps", "30",
+      "--encoder-low-latency", "false",
       "--encoder-bitrate", "20000000",
       "--output-overlay", "rga",
       "--output-video", "/edge/workspace/vis_modelzoo_full.h264",
@@ -111,10 +112,41 @@ bool testRockchipStableOutputFlags() {
          expect(!result.config.rknnZeroCopy, "expected rknn-zero-copy override to be parsed") &&
          expect(result.config.progressEvery == 300, "expected progress interval to be parsed") &&
          expect(result.config.encoderFps == 30, "expected encoder fps to be parsed") &&
+         expect(result.config.encoderLowLatency == 0, "expected encoder low-latency override to be parsed") &&
          expect(result.config.encoderBitrate == 20000000, "expected encoder bitrate to be parsed") &&
          expect(result.config.visual.outputOverlayMode == OutputOverlayMode::kRga,
                 "expected output overlay mode to be parsed") &&
          expect(result.config.visual.outputVideo == "/edge/workspace/vis_modelzoo_full.h264", "expected output video path to be parsed");
+}
+
+bool testInferWorkersAutoDefaultAndExplicitZero() {
+  std::vector<std::string> defaultArguments = {
+      "video_pipeline",
+      "--backend", "rockchip",
+      "stream.mp4",
+      "model.rknn",
+      "640",
+      "640"};
+  std::vector<char*> defaultArgv = makeArgv(defaultArguments);
+  const ParseResult defaultResult =
+      parseAppConfig(static_cast<int>(defaultArgv.size()), defaultArgv.data());
+
+  std::vector<std::string> explicitArguments = {
+      "video_pipeline",
+      "--backend", "rockchip",
+      "--infer-workers", "0",
+      "stream.mp4",
+      "model.rknn",
+      "640",
+      "640"};
+  std::vector<char*> explicitArgv = makeArgv(explicitArguments);
+  const ParseResult explicitResult =
+      parseAppConfig(static_cast<int>(explicitArgv.size()), explicitArgv.data());
+
+  return expect(defaultResult.status == ParseStatus::kOk, "expected default infer-workers to parse successfully") &&
+         expect(defaultResult.config.inferWorkers == 0, "expected default infer-workers to remain auto") &&
+         expect(explicitResult.status == ParseStatus::kOk, "expected explicit infer-workers 0 to parse successfully") &&
+         expect(explicitResult.config.inferWorkers == 0, "expected explicit infer-workers 0 to mean auto");
 }
 
 bool testVisualStyleParsing() {
@@ -207,6 +239,7 @@ int main() {
   ok = ok && testRejectUnknownOption();
   ok = ok && testRejectMissingOptionValue();
   ok = ok && testRockchipStableOutputFlags();
+  ok = ok && testInferWorkersAutoDefaultAndExplicitZero();
   ok = ok && testVisualStyleParsing();
   ok = ok && testRtspOutputParsing();
   ok = ok && testEncoderCodecAliasParsing();

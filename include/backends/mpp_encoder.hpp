@@ -9,6 +9,8 @@ extern "C" {
 }
 
 #include <fstream>
+#include <cstddef>
+#include <cstdint>
 #include <string>
 #include <mutex>
 #include <vector>
@@ -57,6 +59,8 @@ class MppEncoder : public IEncoderBackend {
   bool outputMuxingRequested_ = false;
   bool muxHeaderWritten_ = false;
   bool rtspOutput_ = false;
+  bool outputDisconnected_ = false;
+  bool timingEnabled_ = false;
   int width_ = 0;
   int height_ = 0;
   int horStride_ = 0;
@@ -71,4 +75,8 @@ class MppEncoder : public IEncoderBackend {
   int64_t packetDurationTicks_ = 1;
   int packetTimebaseNum_ = 1;
   int packetTimebaseDen_ = 1;
+  std::size_t timedFrameCount_ = 0;
+  double totalEncodePutMs_ = 0.0;
+  double totalEncodeGetMs_ = 0.0;
+  double totalWritePacketMs_ = 0.0;
 };

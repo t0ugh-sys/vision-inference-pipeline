@@ -23,7 +23,7 @@ struct AppConfig {
   bool verbose = false;
   bool dumpFirstFrame = false;
   ModelOutputLayout modelOutputLayout = ModelOutputLayout::kAuto;
-  int inferWorkers = 1;
+  int inferWorkers = 0;
   int progressEvery = 30;
   bool rknnZeroCopy = true;
   RknnCoreMaskMode rknnCoreMask = RknnCoreMaskMode::kAuto;
@@ -34,6 +34,7 @@ struct AppConfig {
   std::string encoderCodec = "h264";
   int encoderBitrate = 0;
   int encoderFps = 0;
+  int encoderLowLatency = -1;
 };
 
 enum class ParseStatus {

@@ -36,7 +36,6 @@ extern "C" {
 #include <optional>
 #include <stdexcept>
 #include <thread>
-#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -73,6 +72,12 @@ struct RgbColor {
   std::uint8_t r = 0;
   std::uint8_t g = 0;
   std::uint8_t b = 0;
+};
+
+struct YuvColor {
+  std::uint8_t y = 0;
+  std::uint8_t u = 128;
+  std::uint8_t v = 128;
 };
 
 constexpr RgbColor kUltralyticsPalette[] = {
@@ -233,6 +238,16 @@ InferRuntimeConfig makeInferRuntimeConfig(const AppConfig& config, int workerInd
           ? resolveAutoRknnCoreMask(workerIndex, runtime.workerCount)
           : config.rknnCoreMask;
   return runtime;
+}
+
+int resolveInferWorkerCount(const AppConfig& config, InferBackendType selectedInferBackend) {
+  if (config.inferWorkers > 0) {
+    return config.inferWorkers;
+  }
+  if (selectedInferBackend == InferBackendType::kRockchipRknn) {
+    return 3;
+  }
+  return 1;
 }
 
 std::string toLowerAscii(std::string value) {
@@ -410,6 +425,145 @@ void fillRgbaRect(
   }
 }
 
+std::uint8_t clampToByte(int value) {
+  return static_cast<std::uint8_t>(std::clamp(value, 0, 255));
+}
+
+YuvColor rgbToNv12Color(std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+  const int y = ((66 * static_cast<int>(r) + 129 * static_cast<int>(g) + 25 * static_cast<int>(b) + 128) >> 8) + 16;
+  const int u = ((-38 * static_cast<int>(r) - 74 * static_cast<int>(g) + 112 * static_cast<int>(b) + 128) >> 8) + 128;
+  const int v = ((112 * static_cast<int>(r) - 94 * static_cast<int>(g) - 18 * static_cast<int>(b) + 128) >> 8) + 128;
+  return {clampToByte(y), clampToByte(u), clampToByte(v)};
+}
+
+std::uint8_t alphaBlendByte(std::uint8_t dst, std::uint8_t src, std::uint8_t alpha) {
+  const int invAlpha = 255 - static_cast<int>(alpha);
+  return static_cast<std::uint8_t>(
+      (static_cast<int>(dst) * invAlpha + static_cast<int>(src) * static_cast<int>(alpha) + 127) / 255);
+}
+
+void fillNv12Rect(
+    std::uint8_t* yPlane,
+    std::uint8_t* uvPlane,
+    int yStride,
+    int uvStride,
+    int imageWidth,
+    int imageHeight,
+    int x,
+    int y,
+    int width,
+    int height,
+    const YuvColor& color,
+    std::uint8_t alpha) {
+  const int x0 = std::clamp(x, 0, imageWidth);
+  const int y0 = std::clamp(y, 0, imageHeight);
+  const int x1 = std::clamp(x + width, 0, imageWidth);
+  const int y1 = std::clamp(y + height, 0, imageHeight);
+  if (x0 >= x1 || y0 >= y1) {
+    return;
+  }
+
+  if (alpha == 255) {
+    for (int yy = y0; yy < y1; ++yy) {
+      std::uint8_t* row = yPlane + static_cast<std::size_t>(yy) * yStride;
+      std::memset(row + x0, color.y, static_cast<std::size_t>(x1 - x0));
+    }
+
+    const int uvX0 = x0 & ~1;
+    const int uvY0 = y0 & ~1;
+    const int uvX1 = (x1 + 1) & ~1;
+    const int uvY1 = (y1 + 1) & ~1;
+    for (int yy = uvY0; yy < uvY1; yy += 2) {
+      std::uint8_t* row = uvPlane + static_cast<std::size_t>(yy / 2) * uvStride;
+      for (int xx = uvX0; xx < uvX1; xx += 2) {
+        row[xx + 0] = color.u;
+        row[xx + 1] = color.v;
+      }
+    }
+    return;
+  }
+
+  for (int yy = y0; yy < y1; ++yy) {
+    std::uint8_t* row = yPlane + static_cast<std::size_t>(yy) * yStride;
+    for (int xx = x0; xx < x1; ++xx) {
+      row[xx] = alphaBlendByte(row[xx], color.y, alpha);
+    }
+  }
+
+  const int uvX0 = x0 & ~1;
+  const int uvY0 = y0 & ~1;
+  const int uvX1 = (x1 + 1) & ~1;
+  const int uvY1 = (y1 + 1) & ~1;
+  for (int yy = uvY0; yy < uvY1; yy += 2) {
+    std::uint8_t* row = uvPlane + static_cast<std::size_t>(yy / 2) * uvStride;
+    for (int xx = uvX0; xx < uvX1; xx += 2) {
+      row[xx + 0] = alphaBlendByte(row[xx + 0], color.u, alpha);
+      row[xx + 1] = alphaBlendByte(row[xx + 1], color.v, alpha);
+    }
+  }
+}
+
+void drawNv12Rectangle(
+    std::uint8_t* yPlane,
+    std::uint8_t* uvPlane,
+    int yStride,
+    int uvStride,
+    int imageWidth,
+    int imageHeight,
+    int x,
+    int y,
+    int width,
+    int height,
+    int thickness,
+    const YuvColor& color,
+    std::uint8_t alpha) {
+  if (width <= 0 || height <= 0 || thickness <= 0) {
+    return;
+  }
+
+  fillNv12Rect(yPlane, uvPlane, yStride, uvStride, imageWidth, imageHeight, x, y, width, thickness, color, alpha);
+  fillNv12Rect(
+      yPlane, uvPlane, yStride, uvStride, imageWidth, imageHeight, x, y + height - thickness, width, thickness, color, alpha);
+  fillNv12Rect(yPlane, uvPlane, yStride, uvStride, imageWidth, imageHeight, x, y, thickness, height, color, alpha);
+  fillNv12Rect(
+      yPlane, uvPlane, yStride, uvStride, imageWidth, imageHeight, x + width - thickness, y, thickness, height, color, alpha);
+}
+
+void blendNv12Pixel(
+    std::uint8_t* yPlane,
+    std::uint8_t* uvPlane,
+    int yStride,
+    int uvStride,
+    int imageWidth,
+    int imageHeight,
+    int x,
+    int y,
+    const YuvColor& color,
+    std::uint8_t alpha) {
+  if (x < 0 || y < 0 || x >= imageWidth || y >= imageHeight) {
+    return;
+  }
+
+  if (alpha == 255) {
+    yPlane[static_cast<std::size_t>(y) * yStride + x] = color.y;
+    const int uvX = x & ~1;
+    const int uvY = y & ~1;
+    std::uint8_t* uv = uvPlane + static_cast<std::size_t>(uvY / 2) * uvStride + uvX;
+    uv[0] = color.u;
+    uv[1] = color.v;
+    return;
+  }
+
+  yPlane[static_cast<std::size_t>(y) * yStride + x] =
+      alphaBlendByte(yPlane[static_cast<std::size_t>(y) * yStride + x], color.y, alpha);
+
+  const int uvX = x & ~1;
+  const int uvY = y & ~1;
+  std::uint8_t* uv = uvPlane + static_cast<std::size_t>(uvY / 2) * uvStride + uvX;
+  uv[0] = alphaBlendByte(uv[0], color.u, alpha);
+  uv[1] = alphaBlendByte(uv[1], color.v, alpha);
+}
+
 RgbColor ultralyticsColorForClass(int classId) {
   const std::size_t paletteSize = sizeof(kUltralyticsPalette) / sizeof(kUltralyticsPalette[0]);
   const std::size_t index =
@@ -441,6 +595,29 @@ int resizeNearestC1(
   }
 
   return 0;
+}
+
+const std::vector<unsigned char>& resizedMonoGlyph(int fontBitmapIndex, int fontPixelSize) {
+  static std::mutex cacheMutex;
+  static std::map<int, std::vector<std::vector<unsigned char>>> cacheBySize;
+
+  std::lock_guard<std::mutex> lock(cacheMutex);
+  auto& cache = cacheBySize[fontPixelSize];
+  if (cache.empty()) {
+    cache.resize(95);
+  }
+  auto& glyph = cache[static_cast<std::size_t>(fontBitmapIndex)];
+  if (glyph.empty()) {
+    glyph.resize(static_cast<std::size_t>(fontPixelSize * fontPixelSize * 2));
+    resizeNearestC1(
+        mono_font_data[fontBitmapIndex],
+        20,
+        40,
+        glyph.data(),
+        fontPixelSize,
+        fontPixelSize * 2);
+  }
+  return glyph;
 }
 
 void drawRectangleOnOverlay(
@@ -477,9 +654,6 @@ void drawTextOnOverlay(
     std::uint8_t r,
     std::uint8_t g,
     std::uint8_t b) {
-  std::vector<unsigned char> resizedFontBitmap(
-      static_cast<std::size_t>(fontPixelSize * fontPixelSize * 2));
-
   const int n = static_cast<int>(std::strlen(text));
   int cursorX = x;
   int cursorY = y;
@@ -498,8 +672,7 @@ void drawTextOnOverlay(
     if (fontBitmapIndex < 0 || fontBitmapIndex >= 95) {
       continue;
     }
-    const unsigned char* fontBitmap = mono_font_data[fontBitmapIndex];
-    resizeNearestC1(fontBitmap, 20, 40, resizedFontBitmap.data(), fontPixelSize, fontPixelSize * 2);
+    const auto& resizedFontBitmap = resizedMonoGlyph(fontBitmapIndex, fontPixelSize);
 
     for (int yy = cursorY; yy < cursorY + fontPixelSize * 2; ++yy) {
       if (yy < 0) {
@@ -526,6 +699,62 @@ void drawTextOnOverlay(
         rgba[offset + 1] = static_cast<unsigned char>((rgba[offset + 1] * (255 - a) + g * a) / 255);
         rgba[offset + 2] = static_cast<unsigned char>((rgba[offset + 2] * (255 - a) + b * a) / 255);
         rgba[offset + 3] = std::max(rgba[offset + 3], a);
+      }
+    }
+
+    cursorX += fontPixelSize;
+  }
+}
+
+void drawTextOnNv12(
+    std::uint8_t* yPlane,
+    std::uint8_t* uvPlane,
+    int yStride,
+    int uvStride,
+    int imageWidth,
+    int imageHeight,
+    const char* text,
+    int x,
+    int y,
+    int fontPixelSize,
+    const YuvColor& color) {
+  const int n = static_cast<int>(std::strlen(text));
+  int cursorX = x;
+  int cursorY = y;
+  for (int i = 0; i < n; ++i) {
+    const char ch = text[i];
+    if (ch == '\n') {
+      cursorX = x;
+      cursorY += fontPixelSize * 2;
+      continue;
+    }
+    if (std::isprint(static_cast<unsigned char>(ch)) == 0) {
+      continue;
+    }
+
+    const int fontBitmapIndex = ch - ' ';
+    if (fontBitmapIndex < 0 || fontBitmapIndex >= 95) {
+      continue;
+    }
+    const auto& resizedFontBitmap = resizedMonoGlyph(fontBitmapIndex, fontPixelSize);
+
+    for (int yy = 0; yy < fontPixelSize * 2; ++yy) {
+      const int pixelY = cursorY + yy;
+      if (pixelY < 0 || pixelY >= imageHeight) {
+        continue;
+      }
+
+      const unsigned char* alphaRow =
+          resizedFontBitmap.data() + static_cast<std::size_t>(yy) * fontPixelSize;
+      for (int xx = 0; xx < fontPixelSize; ++xx) {
+        const int pixelX = cursorX + xx;
+        if (pixelX < 0 || pixelX >= imageWidth) {
+          continue;
+        }
+        if (alphaRow[xx] < 128) {
+          continue;
+        }
+        blendNv12Pixel(yPlane, uvPlane, yStride, uvStride, imageWidth, imageHeight, pixelX, pixelY, color, 255);
       }
     }
 
@@ -603,13 +832,10 @@ DecodedFrame makeAnnotatedEncodeFrame(
     const DecodedFrame& frame,
     const DetectionResult& result,
     const VisualConfig& config) {
-  std::lock_guard<std::mutex> rgaLock(globalRgaMutex());
   if (frame.dmaFd < 0 || result.boxes.empty()) {
     return frame;
   }
 
-  // Keep these groups alive across frames so the hardware overlay path does not
-  // churn DRM buffers on every annotated output frame.
   static MppBufferGroup outputGroup = nullptr;
   if (outputGroup == nullptr) {
     if (mpp_buffer_group_get_internal(
@@ -618,90 +844,53 @@ DecodedFrame makeAnnotatedEncodeFrame(
       throw std::runtime_error("mpp_buffer_group_get_internal failed for hardware overlay output");
     }
   }
-  static MppBufferGroup rgbaGroup = nullptr;
-  if (rgbaGroup == nullptr) {
-    if (mpp_buffer_group_get_internal(
-            &rgbaGroup,
-            static_cast<MppBufferType>(MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE)) != MPP_OK) {
-      throw std::runtime_error("mpp_buffer_group_get_internal failed for hardware overlay RGBA scratch");
-    }
-  }
 
   const int horStride = frame.horizontalStride > 0 ? frame.horizontalStride : frame.width;
   const int verStride = frame.verticalStride > 0 ? frame.verticalStride : frame.height;
-  const std::size_t outputBytes =
-      static_cast<std::size_t>(horStride) * static_cast<std::size_t>(verStride) * 3 / 2;
-  const std::size_t rgbaBytes =
-      static_cast<std::size_t>(horStride) * static_cast<std::size_t>(verStride) * 4;
-  const std::size_t overlayBytes =
-      static_cast<std::size_t>(frame.width) * static_cast<std::size_t>(frame.height) * 4;
+  const int uvStride = frame.chromaStride > 0 ? frame.chromaStride : horStride;
+  const std::size_t yBytes = static_cast<std::size_t>(horStride) * static_cast<std::size_t>(verStride);
+  const std::size_t uvBytes = static_cast<std::size_t>(uvStride) * static_cast<std::size_t>(verStride / 2);
+  const std::size_t outputBytes = yBytes + uvBytes;
 
   MppBuffer outputBuffer = nullptr;
   if (mpp_buffer_get(outputGroup, &outputBuffer, outputBytes) != MPP_OK || outputBuffer == nullptr) {
     throw std::runtime_error("mpp_buffer_get failed for hardware overlay NV12 output buffer");
   }
-  MppBuffer rgbaBuffer = nullptr;
-  if (mpp_buffer_get(rgbaGroup, &rgbaBuffer, rgbaBytes) != MPP_OK || rgbaBuffer == nullptr) {
-    mpp_buffer_put(outputBuffer);
-    throw std::runtime_error("mpp_buffer_get failed for hardware overlay RGBA scratch buffer");
-  }
-
-  std::vector<std::uint8_t> overlayData(overlayBytes, 0);
-  rga_buffer_handle_t srcHandle = 0;
-  rga_buffer_handle_t overlayHandle = 0;
-  rga_buffer_handle_t rgbaHandle = 0;
-  rga_buffer_handle_t outputHandle = 0;
   try {
-    srcHandle = importbuffer_fd(frame.dmaFd, horStride, verStride, RK_FORMAT_YCbCr_420_SP);
-    if (srcHandle == 0) {
-      throw std::runtime_error("RGA importbuffer_fd failed for hardware overlay source");
+    MppBuffer srcBuffer = static_cast<MppBuffer>(frame.nativeHandle.get());
+    auto* dstPtr = static_cast<std::uint8_t*>(mpp_buffer_get_ptr(outputBuffer));
+    auto* srcPtr = srcBuffer != nullptr ? static_cast<std::uint8_t*>(mpp_buffer_get_ptr(srcBuffer)) : nullptr;
+    if (dstPtr == nullptr) {
+      throw std::runtime_error("Failed to map destination NV12 buffer");
     }
 
-    overlayHandle = importbuffer_virtualaddr(overlayData.data(), static_cast<int>(overlayBytes));
-    if (overlayHandle == 0) {
-      throw std::runtime_error("RGA importbuffer_virtualaddr failed for hardware overlay RGBA handle");
+    if (srcPtr != nullptr) {
+      std::memcpy(dstPtr, srcPtr, outputBytes);
+    } else if (frame.yData.size() >= yBytes && frame.uvData.size() >= uvBytes) {
+      std::memcpy(dstPtr, frame.yData.data(), yBytes);
+      std::memcpy(dstPtr + yBytes, frame.uvData.data(), uvBytes);
+    } else {
+      throw std::runtime_error("Failed to access source NV12 pixels for annotated output");
     }
-
-    const int rgbaFd = mpp_buffer_get_fd(rgbaBuffer);
-    if (rgbaFd < 0) {
-      throw std::runtime_error("mpp_buffer_get_fd failed for hardware overlay RGBA scratch");
-    }
-    rgbaHandle = importbuffer_fd(rgbaFd, horStride, verStride, RK_FORMAT_RGBA_8888);
-    if (rgbaHandle == 0) {
-      throw std::runtime_error("RGA importbuffer_fd failed for hardware overlay RGBA scratch handle");
-    }
-
-    const int outputFd = mpp_buffer_get_fd(outputBuffer);
-    if (outputFd < 0) {
-      throw std::runtime_error("mpp_buffer_get_fd failed for hardware overlay NV12 output");
-    }
-    outputHandle = importbuffer_fd(outputFd, horStride, verStride, RK_FORMAT_YCbCr_420_SP);
-    if (outputHandle == 0) {
-      throw std::runtime_error("RGA importbuffer_fd failed for hardware overlay NV12 output handle");
-    }
-
-    rga_buffer_t src = wrapbuffer_handle(
-        srcHandle, frame.width, frame.height, RK_FORMAT_YCbCr_420_SP, horStride, verStride);
-    rga_buffer_t overlay = wrapbuffer_handle(
-        overlayHandle, frame.width, frame.height, RK_FORMAT_RGBA_8888);
-    rga_buffer_t rgba = wrapbuffer_handle(
-        rgbaHandle, frame.width, frame.height, RK_FORMAT_RGBA_8888, horStride, verStride);
-    rga_buffer_t dst = wrapbuffer_handle(
-        outputHandle, frame.width, frame.height, RK_FORMAT_YCbCr_420_SP, horStride, verStride);
-
-    // Clear the host RGBA overlay on CPU first. On this board the RGA_COLORFILL
-    // path for this overlay plane is not stable and fails with Invalid argument.
-    std::memset(overlayData.data(), 0, overlayBytes);
-    IM_STATUS status = IM_STATUS_SUCCESS;
+    std::uint8_t* yPlane = dstPtr;
+    std::uint8_t* uvPlane = dstPtr + yBytes;
     const int thickness = std::max(1, kModelZooBoxThickness);
+
     for (const auto& box : result.boxes) {
       const int x1 = std::clamp(static_cast<int>(box.x1), 0, frame.width - 1);
       const int y1 = std::clamp(static_cast<int>(box.y1), 0, frame.height - 1);
       const int x2 = std::clamp(static_cast<int>(box.x2), x1 + 1, frame.width);
       const int y2 = std::clamp(static_cast<int>(box.y2), y1 + 1, frame.height);
       const RgbColor classColor = ultralyticsColorForClass(box.classId);
-      drawRectangleOnOverlay(
-          overlayData,
+      const RgbColor boxColor =
+          config.style == VisualStyle::kYolo ? classColor : RgbColor{0, 0, 255};
+      const YuvColor boxYuv = rgbToNv12Color(boxColor.r, boxColor.g, boxColor.b);
+
+      drawNv12Rectangle(
+          yPlane,
+          uvPlane,
+          horStride,
+          uvStride,
           frame.width,
           frame.height,
           x1,
@@ -709,9 +898,7 @@ DecodedFrame makeAnnotatedEncodeFrame(
           std::max(1, x2 - x1),
           std::max(1, y2 - y1),
           thickness,
-          config.style == VisualStyle::kYolo ? classColor.r : 0,
-          config.style == VisualStyle::kYolo ? classColor.g : 0,
-          config.style == VisualStyle::kYolo ? classColor.b : 255,
+          boxYuv,
           255);
 
       char text[256] = {};
@@ -722,98 +909,71 @@ DecodedFrame makeAnnotatedEncodeFrame(
       } else if (config.showConf) {
         std::snprintf(text, sizeof(text), "%.1f%%", box.score * 100.0f);
       }
-      if (text[0] != '\0') {
-        if (config.style == VisualStyle::kYolo) {
-          const RgbColor textColor = ultralyticsTextColor(classColor);
-          drawYoloLabelBoxOnOverlay(
-              overlayData,
-              frame.width,
-              frame.height,
-              text,
-              x1,
-              y1,
-              kModelZooFontPixelSize,
-              classColor.r,
-              classColor.g,
-              classColor.b,
-              220,
-              textColor.r,
-              textColor.g,
-              textColor.b);
-        } else {
-          drawTextOnOverlay(
-              overlayData,
-              frame.width,
-              frame.height,
-              text,
-              x1,
-              y1 - 20,
-              kModelZooFontPixelSize,
-              255,
-              0,
-              0);
+      if (text[0] == '\0') {
+        continue;
+      }
+
+      if (config.style == VisualStyle::kYolo) {
+        const RgbColor textColor = ultralyticsTextColor(classColor);
+        const YuvColor bgYuv = rgbToNv12Color(classColor.r, classColor.g, classColor.b);
+        const YuvColor textYuv = rgbToNv12Color(textColor.r, textColor.g, textColor.b);
+        const int textLength = static_cast<int>(std::strlen(text));
+        const int charWidth = std::max(6, kModelZooFontPixelSize);
+        const int padX = std::max(4, kModelZooFontPixelSize / 2);
+        const int padY = std::max(3, kModelZooFontPixelSize / 3);
+        const int labelWidth = textLength * charWidth + padX * 2;
+        const int labelHeight = kModelZooFontPixelSize * 2 + padY * 2;
+        int labelX = std::clamp(x1, 0, std::max(0, frame.width - 1));
+        int labelY = y1 - labelHeight;
+        if (labelY < 0) {
+          labelY = std::clamp(y1 + 1, 0, std::max(0, frame.height - 1));
         }
+        fillNv12Rect(
+            yPlane,
+            uvPlane,
+            horStride,
+            uvStride,
+            frame.width,
+            frame.height,
+            labelX,
+            labelY,
+            std::min(labelWidth, std::max(0, frame.width - labelX)),
+            std::min(labelHeight, std::max(0, frame.height - labelY)),
+            bgYuv,
+            255);
+        drawTextOnNv12(
+            yPlane,
+            uvPlane,
+            horStride,
+            uvStride,
+            frame.width,
+            frame.height,
+            text,
+            labelX + padX,
+            labelY + padY,
+            kModelZooFontPixelSize,
+            textYuv);
+      } else {
+        drawTextOnNv12(
+            yPlane,
+            uvPlane,
+            horStride,
+            uvStride,
+            frame.width,
+            frame.height,
+            text,
+            x1,
+            y1 - 20,
+            kModelZooFontPixelSize,
+            rgbToNv12Color(255, 0, 0));
       }
     }
-
-    // Use the official stable building blocks from librga:
-    // 1. imcvtcolor: NV12 -> RGBA
-    // 2. imblend: RGBA overlay over RGBA background
-    // 3. imcvtcolor: RGBA -> NV12
-    // This avoids the direct YUV alpha composite path that produced black
-    // output on this board/driver combination.
-    int checkStatus = imcheck(src, rgba, {}, {});
-    if (checkStatus != IM_STATUS_NOERROR) {
-      throw std::runtime_error(
-          std::string("RGA imcheck failed for NV12->RGBA conversion: ") +
-          imStrError_t(static_cast<IM_STATUS>(checkStatus)));
-    }
-    status = imcvtcolor(src, rgba, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGBA_8888);
-    if (status != IM_STATUS_SUCCESS) {
-      throw std::runtime_error(
-          std::string("RGA NV12->RGBA conversion failed for hardware overlay: ") + imStrError_t(status));
-    }
-
-    checkStatus = imcheck(overlay, rgba, {}, {});
-    if (checkStatus != IM_STATUS_NOERROR) {
-      throw std::runtime_error(
-          std::string("RGA imcheck failed for RGBA overlay blend: ") +
-          imStrError_t(static_cast<IM_STATUS>(checkStatus)));
-    }
-    status = imblend(overlay, rgba, IM_ALPHA_BLEND_SRC_OVER | IM_ALPHA_BLEND_PRE_MUL);
-    if (status != IM_STATUS_SUCCESS) {
-      throw std::runtime_error(
-          std::string("RGA RGBA overlay blend failed: ") + imStrError_t(status));
-    }
-
-    checkStatus = imcheck(rgba, dst, {}, {});
-    if (checkStatus != IM_STATUS_NOERROR) {
-      throw std::runtime_error(
-          std::string("RGA imcheck failed for RGBA->NV12 conversion: ") +
-          imStrError_t(static_cast<IM_STATUS>(checkStatus)));
-    }
-    status = imcvtcolor(rgba, dst, RK_FORMAT_RGBA_8888, RK_FORMAT_YCbCr_420_SP);
-    if (status != IM_STATUS_SUCCESS) {
-      throw std::runtime_error(
-          std::string("RGA RGBA->NV12 conversion failed for hardware overlay: ") + imStrError_t(status));
-    }
-
-    releasebuffer_handle(srcHandle);
-    releasebuffer_handle(overlayHandle);
-    releasebuffer_handle(rgbaHandle);
-    releasebuffer_handle(outputHandle);
-    mpp_buffer_put(rgbaBuffer);
 
     DecodedFrame annotated = frame;
     annotated.dmaFd = mpp_buffer_get_fd(outputBuffer);
     annotated.nativeHandle = makeMppBufferOwner(outputBuffer);
     return annotated;
   } catch (...) {
-    if (srcHandle != 0) releasebuffer_handle(srcHandle);
-    if (overlayHandle != 0) releasebuffer_handle(overlayHandle);
-    if (rgbaHandle != 0) releasebuffer_handle(rgbaHandle);
-    if (outputHandle != 0) releasebuffer_handle(outputHandle);
-    if (rgbaBuffer != nullptr) mpp_buffer_put(rgbaBuffer);
     if (outputBuffer != nullptr) mpp_buffer_put(outputBuffer);
     throw;
   }
@@ -839,8 +999,8 @@ void validateAppConfig(const AppConfig& config) {
   if (config.maxFrames < 0) {
     throw std::runtime_error("maxFrames must be greater than or equal to 0");
   }
-  if (config.inferWorkers <= 0) {
-    throw std::runtime_error("inferWorkers must be greater than 0");
+  if (config.inferWorkers < 0) {
+    throw std::runtime_error("inferWorkers must be greater than or equal to 0");
   }
 
   requireCompiledIn(config.decoderBackend, "decoder", isCompiledIn, availableDecoderBackends, toString);
@@ -934,8 +1094,6 @@ void runPipeline(const AppConfig& config) {
   const bool needsVisualizerDraw = config.visual.display ||
                                    (!annotatedOutputPath.empty() && !useRgaAnnotatedOutput);
   const bool needsDisplayFrame = needsVisualizerDraw || config.dumpFirstFrame;
-  const std::size_t inferenceQueueCapacity = static_cast<std::size_t>(std::max(2, config.inferWorkers * 2));
-  const std::size_t rgaMaxInflightFrames = static_cast<std::size_t>(std::max(1, config.inferWorkers * 2 + 4));
   const PostprocBackendType resolvedPostprocBackend = resolvePostprocBackend(config);
   const DecoderBackendType selectedDecoderBackend =
       config.decoderBackend == DecoderBackendType::kAuto ? detectAvailableDecoderBackend() : config.decoderBackend;
@@ -943,6 +1101,9 @@ void runPipeline(const AppConfig& config) {
       config.preprocBackend == PreprocBackendType::kAuto ? detectAvailablePreprocBackend() : config.preprocBackend;
   const InferBackendType selectedInferBackend =
       config.inferBackend == InferBackendType::kAuto ? detectAvailableInferBackend() : config.inferBackend;
+  const int resolvedInferWorkers = resolveInferWorkerCount(config, selectedInferBackend);
+  const std::size_t inferenceQueueCapacity = static_cast<std::size_t>(std::max(2, resolvedInferWorkers * 2));
+  const std::size_t rgaMaxInflightFrames = static_cast<std::size_t>(std::max(1, resolvedInferWorkers * 2 + 4));
 
   if (config.verbose) {
     std::cerr << "[PIPELINE] capabilities"
@@ -964,6 +1125,7 @@ void runPipeline(const AppConfig& config) {
               << " letterbox=" << (config.letterbox ? "on" : "off")
               << " rknn_zero_copy=" << (config.rknnZeroCopy ? "on" : "off")
               << " model_output_layout=" << toModelOutputLayoutName(config.modelOutputLayout)
+              << " infer_workers=" << resolvedInferWorkers
               << "\n";
     std::cerr << "[PIPELINE] postproc requested=" << toString(config.postprocBackend)
               << " resolved=" << toString(resolvedPostprocBackend)
@@ -975,7 +1137,7 @@ void runPipeline(const AppConfig& config) {
   int inferInputHeight = config.model.inputHeight;
   {
     auto inferProbe = createInferBackend(config.inferBackend);
-    inferProbe->open(config.model, makeInferRuntimeConfig(config, 0, config.inferWorkers));
+    inferProbe->open(config.model, makeInferRuntimeConfig(config, 0, resolvedInferWorkers));
     inferInputWidth = inferProbe->inputWidth() > 0 ? inferProbe->inputWidth() : config.model.inputWidth;
     inferInputHeight = inferProbe->inputHeight() > 0 ? inferProbe->inputHeight() : config.model.inputHeight;
     if (config.verbose) {
@@ -1002,7 +1164,7 @@ void runPipeline(const AppConfig& config) {
               << " postproc=" << toString(resolvedPostprocBackend)
               << " source=" << sourceVideoInfo.width << "x" << sourceVideoInfo.height
               << " fps=" << sourceVideoInfo.fpsNum << "/" << sourceVideoInfo.fpsDen
-              << " infer_workers=" << config.inferWorkers << "\n";
+              << " infer_workers=" << resolvedInferWorkers << "\n";
   }
 
   BoundedQueue<PreparedFrame> preparedQueue(inferenceQueueCapacity);
@@ -1018,12 +1180,12 @@ void runPipeline(const AppConfig& config) {
   };
 
   std::vector<std::thread> inferWorkers;
-  inferWorkers.reserve(static_cast<std::size_t>(config.inferWorkers));
-  for (int workerIndex = 0; workerIndex < config.inferWorkers; ++workerIndex) {
+  inferWorkers.reserve(static_cast<std::size_t>(resolvedInferWorkers));
+  for (int workerIndex = 0; workerIndex < resolvedInferWorkers; ++workerIndex) {
     inferWorkers.emplace_back([&, workerIndex] {
       try {
         auto infer = createInferBackend(config.inferBackend);
-        infer->open(config.model, makeInferRuntimeConfig(config, workerIndex, config.inferWorkers));
+        infer->open(config.model, makeInferRuntimeConfig(config, workerIndex, resolvedInferWorkers));
         auto postproc = createPostprocBackend(resolvedPostprocBackend, makePostprocessOptions(config));
 
         PreparedFrame prepared;
@@ -1093,6 +1255,9 @@ void runPipeline(const AppConfig& config) {
       std::size_t nextIndex = 0;
       std::size_t displayedCount = 0;
       const auto outputStart = Clock::now();
+      double totalOverlayMs = 0.0;
+      double totalAnnotatedEncodeMs = 0.0;
+      std::size_t timedAnnotatedFrames = 0;
       ProcessedFrame processed;
       while (processedQueue.pop(processed)) {
         pending.emplace(processed.index, std::move(processed));
@@ -1127,6 +1292,7 @@ void runPipeline(const AppConfig& config) {
                 : current.decodedFrame.height;
             encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
             encCfg.inputFormat = PixelFormat::kNv12;
+            encCfg.lowLatency = config.encoderLowLatency;
             if (config.verbose) {
               std::cerr << "[PIPELINE] init_raw_encoder backend=" << encoder->name()
                         << " codec=" << encCfg.codec
@@ -1182,6 +1348,10 @@ void runPipeline(const AppConfig& config) {
               if (needsDisplayFrame) {
                 std::cout << " display_preproc_ms=" << displayPreprocMs;
               }
+              if (timedAnnotatedFrames > 0) {
+                std::cout << " overlay_ms_avg=" << (totalOverlayMs / timedAnnotatedFrames)
+                          << " annot_enc_ms_avg=" << (totalAnnotatedEncodeMs / timedAnnotatedFrames);
+              }
             }
             std::cout << "\n";
           }
@@ -1217,6 +1387,7 @@ void runPipeline(const AppConfig& config) {
                 encCfg.height = useRgaAnnotatedOutput ? current.decodedFrame.height : drawnImage.height;
                 encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
                 encCfg.inputFormat = useRgaAnnotatedOutput ? PixelFormat::kNv12 : PixelFormat::kRgb888;
+                encCfg.lowLatency = config.encoderLowLatency;
                 if (config.verbose) {
                   std::cerr << "[PIPELINE] init_annotated_encoder backend=" << annotatedVideoEncoder->name()
                             << " codec=" << encCfg.codec
@@ -1232,9 +1403,14 @@ void runPipeline(const AppConfig& config) {
               }
               if (keepEncodedFrame) {
                 if (useRgaAnnotatedOutput) {
+                  const auto overlayStart = Clock::now();
                   DecodedFrame annotatedFrame =
                       makeAnnotatedEncodeFrame(current.decodedFrame, current.result, config.visual);
+                  totalOverlayMs += Ms(Clock::now() - overlayStart).count();
+                  const auto encodeStart = Clock::now();
                   annotatedVideoEncoder->encodeDecodedFrame(annotatedFrame, current.pts);
+                  totalAnnotatedEncodeMs += Ms(Clock::now() - encodeStart).count();
+                  ++timedAnnotatedFrames;
                 } else {
                   annotatedVideoEncoder->encode(drawnImage, current.pts);
                 }
@@ -1260,6 +1436,7 @@ void runPipeline(const AppConfig& config) {
                   : current.decodedFrame.height;
               encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
               encCfg.inputFormat = PixelFormat::kNv12;
+              encCfg.lowLatency = config.encoderLowLatency;
               if (config.verbose) {
                 std::cerr << "[PIPELINE] init_annotated_encoder backend=" << annotatedVideoEncoder->name()
                           << " codec=" << encCfg.codec
@@ -1274,9 +1451,14 @@ void runPipeline(const AppConfig& config) {
               annotatedVideoEncoderInitialized = true;
             }
             if (keepEncodedFrame) {
+              const auto overlayStart = Clock::now();
               DecodedFrame annotatedFrame =
                   makeAnnotatedEncodeFrame(current.decodedFrame, current.result, config.visual);
+              totalOverlayMs += Ms(Clock::now() - overlayStart).count();
+              const auto encodeStart = Clock::now();
               annotatedVideoEncoder->encodeDecodedFrame(annotatedFrame, current.pts);
+              totalAnnotatedEncodeMs += Ms(Clock::now() - encodeStart).count();
+              ++timedAnnotatedFrames;
             }
           }
 
@@ -1374,7 +1556,16 @@ void runPipeline(const AppConfig& config) {
   outputThread.join();
 
   if (workerError) {
-    std::rethrow_exception(workerError);
+    try {
+      std::rethrow_exception(workerError);
+    } catch (const std::exception& error) {
+      std::cerr << "\n[ERROR] Pipeline failed: " << error.what() << '\n';
+    } catch (...) {
+      std::cerr << "\n[ERROR] Pipeline failed with an unknown error\n";
+    }
+    std::cout.flush();
+    std::cerr.flush();
+    std::_Exit(1);
   }
 
   // Some board-side Rockchip library combinations still crash during process

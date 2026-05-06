@@ -20,6 +20,7 @@ extern "C" {
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -35,6 +36,8 @@ constexpr size_t kPacketBufferMinSize = 512 * 1024;
 constexpr auto kDrainRetrySleep = std::chrono::milliseconds(2);
 constexpr int kDrainRetryCount = 50;
 constexpr int kFlushDrainRetryCount = 5000;
+using Clock = std::chrono::steady_clock;
+using Ms = std::chrono::duration<double, std::milli>;
 
 void checkMppStatus(MPP_RET status, const char* message) {
   if (status != MPP_OK) {
@@ -86,12 +89,30 @@ bool useNv21ForRgbEncode() {
   return value != nullptr && value[0] != '\0' && std::string(value) != "0";
 }
 
-bool lowLatencyEncodeRequested(bool rtspOutput) {
+bool lowLatencyEncodeRequested(bool rtspOutput, int explicitMode) {
+  if (explicitMode >= 0) {
+    return explicitMode != 0;
+  }
   if (rtspOutput) {
     return true;
   }
   const char* value = std::getenv("MPP_ENCODER_LOW_LATENCY");
   return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+}
+
+bool mppEncoderTimingEnabled() {
+  const char* value = std::getenv("MPP_ENCODER_TIMING");
+  return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+}
+
+int qualityQpMaxForBitrate(int targetBitrate) {
+  if (targetBitrate >= 16'000'000) {
+    return 28;
+  }
+  if (targetBitrate >= 8'000'000) {
+    return 34;
+  }
+  return 45;
 }
 
 void logMppRgbEncodeStep(const char* step) {
@@ -127,6 +148,14 @@ bool startsWithIgnoreCase(const std::string& value, const std::string& prefix) {
 
 bool isRtspUrl(const std::string& value) {
   return startsWithIgnoreCase(value, "rtsp://");
+}
+
+bool isIgnorableRtspWriteError(int status) {
+  return status == AVERROR_EOF ||
+         status == AVERROR(EPIPE) ||
+         status == AVERROR(ECONNRESET) ||
+         status == AVERROR(ECONNABORTED) ||
+         status == AVERROR(ETIMEDOUT);
 }
 
 int64_t computePacketDurationTicks(int fpsNum, int fpsDen, const AVRational& timeBase) {
@@ -302,6 +331,8 @@ void MppEncoder::init(const EncoderConfig& config) {
   nextPacketPts_ = 0;
   outputMuxingRequested_ = hasSuffixIgnoreCase(config.outputPath, ".mp4") || isRtspUrl(config.outputPath);
   rtspOutput_ = isRtspUrl(config.outputPath);
+  outputDisconnected_ = false;
+  timingEnabled_ = mppEncoderTimingEnabled();
   initOutputSink(config);
   logMppRgbEncodeStep("init_output_opened");
 
@@ -343,7 +374,8 @@ void MppEncoder::init(const EncoderConfig& config) {
                  "MPP_SET_OUTPUT_TIMEOUT failed");
   logMppRgbEncodeStep("init_set_timeout_done");
   const int targetBitrate = config.bitrate > 0 ? config.bitrate : 4000000;
-  const bool lowLatencyEncode = lowLatencyEncodeRequested(rtspOutput_);
+  const int qpMax = qualityQpMaxForBitrate(targetBitrate);
+  const bool lowLatencyEncode = lowLatencyEncodeRequested(rtspOutput_, config.lowLatency);
 
   if (config.codec == "hevc" || config.codec == "h265") {
     throw std::runtime_error("Struct-based Rockchip encoder init currently supports h264 output only");
@@ -383,15 +415,15 @@ void MppEncoder::init(const EncoderConfig& config) {
   mpp_enc_cfg_set_s32(config_, "rc:bps_max", targetBitrate * 17 / 16);
   mpp_enc_cfg_set_s32(config_, "rc:bps_min", std::max(1, targetBitrate * 15 / 16));
   mpp_enc_cfg_set_s32(config_, "rc:qp_init", -1);
-  mpp_enc_cfg_set_s32(config_, "rc:qp_max", 51);
-  mpp_enc_cfg_set_s32(config_, "rc:qp_min", 10);
-  mpp_enc_cfg_set_s32(config_, "rc:qp_max_i", 51);
-  mpp_enc_cfg_set_s32(config_, "rc:qp_min_i", 10);
+  mpp_enc_cfg_set_s32(config_, "rc:qp_max", qpMax);
+  mpp_enc_cfg_set_s32(config_, "rc:qp_min", 8);
+  mpp_enc_cfg_set_s32(config_, "rc:qp_max_i", qpMax);
+  mpp_enc_cfg_set_s32(config_, "rc:qp_min_i", 8);
   mpp_enc_cfg_set_s32(config_, "rc:qp_ip", 2);
-  mpp_enc_cfg_set_s32(config_, "rc:fqp_min_i", 10);
-  mpp_enc_cfg_set_s32(config_, "rc:fqp_max_i", 45);
-  mpp_enc_cfg_set_s32(config_, "rc:fqp_min_p", 10);
-  mpp_enc_cfg_set_s32(config_, "rc:fqp_max_p", 45);
+  mpp_enc_cfg_set_s32(config_, "rc:fqp_min_i", 8);
+  mpp_enc_cfg_set_s32(config_, "rc:fqp_max_i", qpMax);
+  mpp_enc_cfg_set_s32(config_, "rc:fqp_min_p", 8);
+  mpp_enc_cfg_set_s32(config_, "rc:fqp_max_p", qpMax);
 
   mpp_enc_cfg_set_s32(config_, "h264:profile", lowLatencyEncode ? 66 : 100);
   mpp_enc_cfg_set_s32(config_, "h264:level", (width_ >= 1920 || height_ >= 1080) ? 40 : 31);
@@ -440,6 +472,9 @@ void MppEncoder::encode(const RgbImage& frame, int64_t pts) {
   logMppRgbEncodeStep("encode_begin");
   if (!initialized_) {
     throw std::runtime_error("MPP encoder is not initialized");
+  }
+  if (outputDisconnected_) {
+    return;
   }
   if (inputFormat_ != PixelFormat::kRgb888) {
     throw std::runtime_error("MPP encoder is not configured for RGB input");
@@ -562,6 +597,9 @@ void MppEncoder::encodeDecodedFrame(const DecodedFrame& frame, int64_t pts) {
   if (!initialized_) {
     throw std::runtime_error("MPP encoder is not initialized");
   }
+  if (outputDisconnected_) {
+    return;
+  }
   if (frame.dmaFd < 0) {
     throw std::runtime_error("MPP encoder requires a valid dma-buf fd");
   }
@@ -599,13 +637,16 @@ void MppEncoder::encodeDecodedFrame(const DecodedFrame& frame, int64_t pts) {
     mpp_frame_set_pts(inputFrame, frameIndex_);
     mpp_frame_set_buffer(inputFrame, inputBuffer);
 
+    const auto putStart = Clock::now();
     checkMppStatus(api_->encode_put_frame(context_, inputFrame), "encode_put_frame failed");
+    totalEncodePutMs_ += Ms(Clock::now() - putStart).count();
     ++frameIndex_;
     mpp_frame_deinit(&inputFrame);
     mpp_buffer_put(inputBuffer);
     inputBuffer = nullptr;
     bool gotPacket = false;
     int retries = 0;
+    const auto getStart = Clock::now();
     while (true) {
       MppPacket packet = nullptr;
       checkMppStatus(api_->encode_get_packet(context_, &packet), "encode_get_packet failed");
@@ -622,6 +663,16 @@ void MppEncoder::encodeDecodedFrame(const DecodedFrame& frame, int64_t pts) {
       mpp_packet_deinit(&packet);
       break;
     }
+    totalEncodeGetMs_ += Ms(Clock::now() - getStart).count();
+    ++timedFrameCount_;
+    if (timingEnabled_ && (timedFrameCount_ == 1 || (timedFrameCount_ % 300 == 0))) {
+      std::cerr << "[MPP] timing"
+                << " frames=" << timedFrameCount_
+                << " put_ms_avg=" << (totalEncodePutMs_ / timedFrameCount_)
+                << " get_ms_avg=" << (totalEncodeGetMs_ / timedFrameCount_)
+                << " write_ms_avg=" << (totalWritePacketMs_ / timedFrameCount_)
+                << "\n";
+    }
   } catch (...) {
     if (inputFrame != nullptr) {
       mpp_frame_deinit(&inputFrame);
@@ -635,6 +686,10 @@ void MppEncoder::encodeDecodedFrame(const DecodedFrame& frame, int64_t pts) {
 
 void MppEncoder::flush() {
   if (!initialized_ || flushSubmitted_) {
+    return;
+  }
+  if (outputDisconnected_) {
+    flushSubmitted_ = true;
     return;
   }
 
@@ -686,6 +741,7 @@ void MppEncoder::close() {
   outputMuxingRequested_ = false;
   muxHeaderWritten_ = false;
   rtspOutput_ = false;
+  outputDisconnected_ = false;
   width_ = 0;
   height_ = 0;
   horStride_ = 0;
@@ -701,8 +757,12 @@ void MppEncoder::close() {
 }
 
 void MppEncoder::writePacket(void* opaquePacket) {
+  const auto writeStart = Clock::now();
   MppPacket packet = static_cast<MppPacket>(opaquePacket);
   if (!packet) {
+    return;
+  }
+  if (outputDisconnected_) {
     return;
   }
 
@@ -738,13 +798,21 @@ void MppEncoder::writePacket(void* opaquePacket) {
         &muxPacket,
         AVRational{packetTimebaseNum_, packetTimebaseDen_},
         muxVideoStream_->time_base);
-    checkAvStatus(av_interleaved_write_frame(muxFormatContext_, &muxPacket),
-                  "av_interleaved_write_frame failed");
+    const int writeStatus = av_interleaved_write_frame(muxFormatContext_, &muxPacket);
+    if (rtspOutput_ && isIgnorableRtspWriteError(writeStatus)) {
+      outputDisconnected_ = true;
+      std::cerr << "[WARN] RTSP output disconnected, stopping packet writes\n";
+      std::cerr.flush();
+      return;
+    }
+    checkAvStatus(writeStatus, "av_interleaved_write_frame failed");
     nextPacketPts_ += packetDurationTicks_;
+    totalWritePacketMs_ += Ms(Clock::now() - writeStart).count();
     return;
   }
 
   outputFile_.write(static_cast<const char*>(data), static_cast<std::streamsize>(length));
+  totalWritePacketMs_ += Ms(Clock::now() - writeStart).count();
 }
 
 void MppEncoder::initOutputSink(const EncoderConfig& config) {
@@ -818,7 +886,7 @@ void MppEncoder::initMp4Muxer(const EncoderConfig& config) {
 
 void MppEncoder::closeOutputSink() {
   if (muxFormatContext_ != nullptr) {
-    if (muxHeaderWritten_) {
+    if (muxHeaderWritten_ && !rtspOutput_) {
       av_write_trailer(muxFormatContext_);
     }
     if ((muxFormatContext_->oformat->flags & AVFMT_NOFILE) == 0 && muxFormatContext_->pb != nullptr) {
