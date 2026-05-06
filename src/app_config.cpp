@@ -63,8 +63,8 @@ ModelOutputLayout parseModelOutputLayout(const std::string& value) {
 }
 
 OutputOverlayMode parseOutputOverlayMode(const std::string& value) {
-  if (value == "cpu") return OutputOverlayMode::kCpu;
-  if (value == "rga") return OutputOverlayMode::kRga;
+  if (value == "cpu" || value == "quality") return OutputOverlayMode::kCpu;
+  if (value == "rga" || value == "fast") return OutputOverlayMode::kRga;
   throw std::runtime_error("Unsupported output overlay mode: " + value);
 }
 
@@ -206,7 +206,7 @@ std::string buildUsageMessage(const std::string& programName) {
   message += "  --display                               Enable display window\n";
   message += "  --display-max-width <n>                 Max display-path width, 0 keeps source width\n";
   message += "  --display-max-height <n>                Max display-path height, 0 keeps source height\n";
-  message += "  --output-overlay <cpu|rga>              Overlay mode for --output-video/--output-rtsp (Rockchip annotated output auto: rga)\n";
+  message += "  --output-overlay <cpu|rga|quality|fast> Overlay mode for --output-video/--output-rtsp (fast=rga, quality=cpu; Rockchip annotated output auto: rga)\n";
   message += "  --visual-style <classic|yolo>           Detection label style (default: yolo)\n";
   message += "  --output-video <path>                   Write annotated video to a file (.h264/.264/.mp4 on Rockchip)\n";
   message += "  --output-rtsp <url>                     Stream annotated video to an RTSP server\n";

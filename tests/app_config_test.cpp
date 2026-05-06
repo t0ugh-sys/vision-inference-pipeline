@@ -164,6 +164,37 @@ bool testVisualStyleParsing() {
          expect(result.config.visual.style == VisualStyle::kClassic, "expected classic visual style to be parsed");
 }
 
+bool testOutputOverlayAliases() {
+  std::vector<std::string> fastArguments = {
+      "video_pipeline",
+      "--backend", "rockchip",
+      "--output-overlay", "fast",
+      "stream.mp4",
+      "model.rknn",
+      "640",
+      "640"};
+  std::vector<char*> fastArgv = makeArgv(fastArguments);
+  const ParseResult fastResult = parseAppConfig(static_cast<int>(fastArgv.size()), fastArgv.data());
+
+  std::vector<std::string> qualityArguments = {
+      "video_pipeline",
+      "--backend", "rockchip",
+      "--output-overlay", "quality",
+      "stream.mp4",
+      "model.rknn",
+      "640",
+      "640"};
+  std::vector<char*> qualityArgv = makeArgv(qualityArguments);
+  const ParseResult qualityResult = parseAppConfig(static_cast<int>(qualityArgv.size()), qualityArgv.data());
+
+  return expect(fastResult.status == ParseStatus::kOk, "expected output-overlay fast to parse successfully") &&
+         expect(fastResult.config.visual.outputOverlayMode == OutputOverlayMode::kRga,
+                "expected output-overlay fast to map to rga") &&
+         expect(qualityResult.status == ParseStatus::kOk, "expected output-overlay quality to parse successfully") &&
+         expect(qualityResult.config.visual.outputOverlayMode == OutputOverlayMode::kCpu,
+                "expected output-overlay quality to map to cpu");
+}
+
 bool testRtspOutputParsing() {
   std::vector<std::string> arguments = {
       "video_pipeline",
@@ -241,6 +272,7 @@ int main() {
   ok = ok && testRockchipStableOutputFlags();
   ok = ok && testInferWorkersAutoDefaultAndExplicitZero();
   ok = ok && testVisualStyleParsing();
+  ok = ok && testOutputOverlayAliases();
   ok = ok && testRtspOutputParsing();
   ok = ok && testEncoderCodecAliasParsing();
   ok = ok && testRejectInvalidEncoderCodec();

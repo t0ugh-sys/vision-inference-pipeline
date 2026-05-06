@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -73,6 +74,10 @@ RgbColor ultralyticsColorForClass(int classId) {
 unsigned int ultralyticsTextColor(const RgbColor& background) {
   const int luminance = static_cast<int>(background.r) + static_cast<int>(background.g) + static_cast<int>(background.b);
   return luminance >= 600 ? encodeRgb888(16, 16, 16) : COLOR_WHITE;
+}
+
+int ultralyticsLineWidth(const RgbImage& image) {
+  return std::max(static_cast<int>(std::lround((image.width + image.height) * 0.003 / 2.0)), 2);
 }
 
 void drawRectangleC3(
@@ -311,6 +316,59 @@ void drawYoloLabelBox(
       cv::LINE_AA);
 }
 
+void drawYoloBoxLabel(
+    RgbImage& image,
+    int x1,
+    int y1,
+    int x2,
+    int y2,
+    const char* text,
+    const RgbColor& classColor) {
+  if (image.data.empty() || image.width <= 0 || image.height <= 0) {
+    return;
+  }
+
+  cv::Mat rgb(image.height, image.width, CV_8UC3, image.data.data());
+  const int lineWidth = ultralyticsLineWidth(image);
+  const int textThickness = std::max(lineWidth - 1, 1);
+  const double fontScale = static_cast<double>(lineWidth) / 3.0;
+  const cv::Scalar color(
+      static_cast<double>(classColor.r),
+      static_cast<double>(classColor.g),
+      static_cast<double>(classColor.b));
+  cv::rectangle(rgb, cv::Point(x1, y1), cv::Point(x2, y2), color, lineWidth, cv::LINE_AA);
+
+  if (text == nullptr || text[0] == '\0') {
+    return;
+  }
+
+  const unsigned int textColor = ultralyticsTextColor(classColor);
+  const cv::Scalar txtColor(
+      static_cast<double>(textColor & 0xFFu),
+      static_cast<double>((textColor >> 8) & 0xFFu),
+      static_cast<double>((textColor >> 16) & 0xFFu));
+  int baseline = 0;
+  cv::Size textSize = cv::getTextSize(text, 0, fontScale, textThickness, &baseline);
+  textSize.height += 3;
+  bool outside = y1 >= textSize.height;
+  int labelX = x1;
+  if (labelX > image.width - textSize.width) {
+    labelX = std::max(0, image.width - textSize.width);
+  }
+  cv::Point p1(labelX, y1);
+  cv::Point p2(labelX + textSize.width, outside ? y1 - textSize.height : y1 + textSize.height);
+  cv::rectangle(rgb, p1, p2, color, cv::FILLED, cv::LINE_AA);
+  cv::putText(
+      rgb,
+      text,
+      cv::Point(labelX, outside ? y1 - 2 : y1 + textSize.height - 1),
+      0,
+      fontScale,
+      txtColor,
+      textThickness,
+      cv::LINE_AA);
+}
+
 cv::Mat rgbImageToMat(const RgbImage& frame) {
   if (frame.width <= 0 || frame.height <= 0) {
     throw std::runtime_error("Visualizer received an invalid frame size");
@@ -359,27 +417,21 @@ class OpenCVVisualizer : public IVisualizer {
 
       const RgbColor classColor = ultralyticsColorForClass(box.classId);
       const unsigned int classColorValue = encodeRgb888(classColor.r, classColor.g, classColor.b);
-      drawRectangle(output, x1, y1, w, h, config_.style == VisualStyle::kYolo ? classColorValue : COLOR_BLUE, kModelZooBoxThickness);
 
       char text[256] = {};
       if (config_.showLabel && !box.label.empty() && config_.showConf) {
-        std::snprintf(text, sizeof(text), "%s %.1f%%", box.label.c_str(), box.score * 100.0f);
+        std::snprintf(text, sizeof(text), "%s %.2f", box.label.c_str(), box.score);
       } else if (config_.showLabel && !box.label.empty()) {
         std::snprintf(text, sizeof(text), "%s", box.label.c_str());
       } else if (config_.showConf) {
-        std::snprintf(text, sizeof(text), "%.1f%%", box.score * 100.0f);
+        std::snprintf(text, sizeof(text), "%.2f", box.score);
       }
-      if (text[0] != '\0') {
-        if (config_.style == VisualStyle::kYolo) {
-          drawYoloLabelBox(
-              output,
-              text,
-              x1,
-              y1,
-              classColorValue,
-              ultralyticsTextColor(classColor),
-              kModelZooFontPixelSize);
-        } else {
+
+      if (config_.style == VisualStyle::kYolo) {
+        drawYoloBoxLabel(output, x1, y1, x2, y2, text, classColor);
+      } else {
+        drawRectangle(output, x1, y1, w, h, COLOR_BLUE, kModelZooBoxThickness);
+        if (text[0] != '\0') {
           drawText(output, text, x1, y1 - 20, COLOR_RED, kModelZooFontPixelSize);
         }
       }
